@@ -251,6 +251,13 @@
   <div id="modal-container" style="display:none;"></div>
 
   <!-- SCRIPTS -->
-  <script src="/js/app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>
+  window.sb = supabase.createClient(
+    'https://ncmwsjoomeevxyffkyaw.supabase.co',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5jbXdzam9vbWVldnh5ZmZreWF3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTU0NDA2MTgsImV4cCI6MjExMTAxNjYxOH0.iS4rIcmAnqDWKlh5xNrO6j3BAF_i4ckhLcg3t8GFARw'
+  );
+</script>
+<script src="/js/app.js"></script>
 </body>
 </html>
