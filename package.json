@@ -1,0 +1,7 @@
+{
+  "name": "sistema-integral-jardines-del-renacer",
+  "version": "2.1.0",
+  "private": true,
+  "description": "Sistema Integral de Activos - Jardines del Renacer (frontend estático + API serverless)",
+  "engines": { "node": "20.x" }
+}
