@@ -48,14 +48,39 @@ async function api(path, options = {}) {
       throw new Error('Sesión expirada');
     }
 
-    const data = await res.json();
+    let data = {};
+    try { data = await res.json(); } catch (_) { /* respuesta no JSON */ }
     if (!res.ok) {
-      throw new Error(data.error || 'Error en la petición');
+      throw new Error(data.error || `Error ${res.status} en la petición`);
     }
     return data;
   } catch (err) {
     showToast(err.message, 'error');
+    err.fromApi = true;
     throw err;
+  }
+}
+
+// DESCARGAS AUTENTICADAS (CSV / LOG): los enlaces <a href> no envían el token
+async function downloadAuthFile(path, fallbackName) {
+  try {
+    const res = await fetch(path, { headers: { 'Authorization': `Bearer ${STATE.token}` } });
+    if (!res.ok) {
+      let msg = `Error ${res.status} al descargar`;
+      try { msg = (await res.json()).error || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const cd = res.headers.get('Content-Disposition') || '';
+    const m = /filename="?([^";]+)"?/.exec(cd);
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : fallbackName;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  } catch (err) {
+    showToast(err.message, 'error');
   }
 }
 
@@ -169,6 +194,7 @@ async function handleRegisterUser(e) {
     showMainApp();
     await loadInitialCatalogs();
     navigate('dashboard');
+    startNotificationPolling();
   } catch (err) {
     // Handled in api()
   }
@@ -220,6 +246,7 @@ async function handleLogin(e) {
     showMainApp();
     await loadInitialCatalogs();
     navigate('dashboard');
+    startNotificationPolling();
     showToast('Bienvenido a Jardines del Renacer', 'success');
   } catch (err) {
     // Handled in api
@@ -231,6 +258,7 @@ function logout() {
   STATE.user = null;
   localStorage.removeItem('jr_token');
   if (STATE.chatPollingInterval) clearInterval(STATE.chatPollingInterval);
+  if (STATE.notifInterval) { clearInterval(STATE.notifInterval); STATE.notifInterval = null; }
   showAuthScreen();
 }
 
@@ -448,7 +476,7 @@ async function renderMaestro() {
         <p style="font-size:0.8rem;color:var(--text-muted);">Base oficial de activos con UUIDs independientes y trazabilidad</p>
       </div>
       <div style="display:flex;gap:10px;">
-        <a href="/api/maestro/export" class="btn btn-outline btn-sm" target="_blank">📥 Exportar CSV</a>
+        <a href="javascript:void(0)" class="btn btn-outline btn-sm" onclick="downloadAuthFile('/api/reportes/1','inventario.csv')">📥 Exportar CSV</a>
         <button class="btn btn-primary btn-sm" onclick="navigate('registro')">➕ Nuevo Registro</button>
       </div>
     </div>
@@ -1068,6 +1096,7 @@ async function renderColaboradores() {
   ]);
 
   const colabs = colabsRes.colaboradores || [];
+  window.lastColabs = colabs;
   const retiradosConActivos = retiradosRes.retirados || [];
 
   const html = `
@@ -2101,7 +2130,7 @@ function renderReportes() {
         ${reportes.map((rep, idx) => `
           <div style="border:1px solid var(--border-color);padding:14px;border-radius:8px;background:#fff;display:flex;justify-content:space-between;align-items:center;">
             <div style="font-size:0.85rem;font-weight:600;color:var(--secondary);">${rep}</div>
-            <a href="/api/maestro/export" class="btn btn-outline btn-sm" target="_blank">Exportar</a>
+            <a href="javascript:void(0)" class="btn btn-outline btn-sm" onclick="downloadAuthFile('/api/reportes/${idx + 1}','reporte.csv')">Exportar</a>
           </div>
         `).join('')}
       </div>
@@ -2135,6 +2164,10 @@ async function renderNotificaciones() {
     </div>
   `;
   document.getElementById('page-content').innerHTML = html;
+  api('/api/notificaciones/leer', { method: 'POST', body: {} }).then(() => {
+    const badge = document.getElementById('notif-count-badge');
+    if (badge) badge.style.display = 'none';
+  }).catch(() => {});
 }
 
 function renderRegionales() {
@@ -2217,7 +2250,7 @@ async function renderConfiguracion() {
           <p style="font-size:0.82rem;color:var(--text-muted);">Monitoreo de salud técnica, archivo oficial de errores (app_errors.log) y base de datos.</p>
         </div>
         <div style="display:flex;gap:10px;">
-          <a href="/api/logs/download" class="btn btn-primary btn-sm" target="_blank">📥 Descargar app_errors.log</a>
+          <a href="javascript:void(0)" class="btn btn-primary btn-sm" onclick="downloadAuthFile('/api/logs/download','app_errors.log')">📥 Descargar app_errors.log</a>
           <button class="btn btn-outline btn-sm" onclick="renderConfiguracion()">🔄 Actualizar</button>
         </div>
       </div>
@@ -2341,31 +2374,25 @@ async function submitResolverError(e, errorId) {
   renderConfiguracion();
 }
 
-// CAPTURA GLOBAL DE ERRORES FRONTEND EN app_errors.log
-window.addEventListener('error', function(event) {
+// CAPTURA GLOBAL DE ERRORES FRONTEND EN app_errors.log (sin bucles: usa fetch directo)
+let _clientErrCount = 0;
+function reportClientError(mensaje, stack) {
+  if (++_clientErrCount > 20) return; // evita inundar el log
   try {
-    api('/api/logs/client-error', {
+    fetch('/api/logs/client-error', {
       method: 'POST',
-      body: {
-        mensaje: event.message,
-        stack: event.error ? event.error.stack : `${event.filename}:${event.lineno}`,
-        url: window.location.href
-      }
-    });
-  } catch(e) {}
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mensaje: String(mensaje || '').slice(0, 500), stack: String(stack || '').slice(0, 2000), url: window.location.href })
+    }).catch(() => {});
+  } catch (e) {}
+}
+window.addEventListener('error', (event) => {
+  reportClientError(event.message, event.error ? event.error.stack : `${event.filename}:${event.lineno}`);
 });
-
-window.addEventListener('unhandledrejection', function(event) {
-  try {
-    api('/api/logs/client-error', {
-      method: 'POST',
-      body: {
-        mensaje: `Promesa rechazada no manejada: ${event.reason}`,
-        stack: event.reason && event.reason.stack ? event.reason.stack : '',
-        url: window.location.href
-      }
-    });
-  } catch(e) {}
+window.addEventListener('unhandledrejection', (event) => {
+  const r = event.reason;
+  if (r && r.fromApi) return; // ya notificado al usuario por api()
+  reportClientError(`Promesa rechazada no manejada: ${r && r.message ? r.message : r}`, r && r.stack ? r.stack : '');
 });
 
 function renderFisico() {
@@ -2406,7 +2433,8 @@ function renderMovimientos() {
 }
 
 function startNotificationPolling() {
-  setInterval(async () => {
+  if (STATE.notifInterval) clearInterval(STATE.notifInterval);
+  const poll = async () => {
     if (STATE.token) {
       try {
         const res = await api('/api/notificaciones');
@@ -2418,7 +2446,9 @@ function startNotificationPolling() {
         }
       } catch (e) {}
     }
-  }, 10000);
+  };
+  poll();
+  STATE.notifInterval = setInterval(poll, 10000);
 }
 
 // INICIALIZAR EN DOM READY
