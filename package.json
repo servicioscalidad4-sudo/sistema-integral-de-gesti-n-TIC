@@ -1,5 +1,9 @@
 {
   "name": "sistema-integral-jardines-del-renacer",
-  "version": "2.1.0",
-  "private": true
+  "version": "3.0.0",
+  "private": true,
+  "description": "Sistema Integral de Activos - Jardines del Renacer (frontend estático + API serverless sobre Supabase)",
+  "dependencies": {
+    "bcryptjs": "2.4.3"
+  }
 }
