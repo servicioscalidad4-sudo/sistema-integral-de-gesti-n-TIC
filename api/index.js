@@ -1,24 +1,26 @@
 // ============================================================================
-// JARDINES DEL RENACER - API (Vercel Serverless Function)
+// JARDINES DEL RENACER - API sobre Supabase (Vercel Serverless Function)
 // Todas las rutas /api/* se reescriben a esta función (ver vercel.json).
 // ============================================================================
 const crypto = require('crypto');
-const { getDb, saveDb, persistence } = require('./_lib/store');
+const D = require('./_lib/db');
 const { hashPassword, verifyPassword, signToken, verifyToken } = require('./_lib/security');
-const { nowCO, todayCO, addDays, pad, sanitize, toCSV, unesc, norm } = require('./_lib/util');
+const { HttpError, nowISO, todayCO, addDays, co, pad, sanitize, cleanOut, toCSV, unesc, norm } = require('./_lib/util');
 
-class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
 const bad = (m) => new HttpError(400, m);
 const forbid = (m) => new HttpError(403, m || 'No tiene permisos para esta acción');
 const notFound = (m) => new HttpError(404, m || 'Registro no encontrado');
-
-const ESTADOS_FISICOS = ['BUENO', 'REGULAR', 'MALO', 'DAÑADO', 'PENDIENTE DE REVISIÓN'];
-const ESTADOS_HALLAZGO = ['ABIERTO', 'EN PROCESO', 'PENDIENTE DE EVIDENCIA', 'EN VALIDACIÓN', 'CERRADO'];
 const EMAIL_DOMAIN = (process.env.ALLOWED_EMAIL_DOMAIN || 'jardinesdelrenacer.com').toLowerCase();
+const ASSET_COLS = 'id,id_origen,codigo_inventario,nombre,descripcion,categoria_id,tipo_elemento,marca,modelo,numero_serie,regional_id,sede_id,dependencia_id,ubicacion_especifica,responsable_id,estado_fisico,estado_operativo,estado_registro,created_at,updated_at';
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const toInt = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : null; };
-const byId = (arr, id) => arr.find((x) => x.id === id || (id != null && String(x.id) === String(id)));
-const nextId = (arr) => arr.reduce((m, x) => Math.max(m, x.id || 0), 0) + 1;
+const str = (v, max = 500) => (v == null ? '' : String(v).slice(0, max));
+const blank = (v) => v == null || String(v).trim() === '';
+const isRetirado = (k) => /retirad/i.test((k && k.estado_vinculacion) || '');
+const isActivoColab = (k) => /^activ/i.test((k && k.estado_vinculacion) || '');
+// Quita caracteres con significado especial en filtros PostgREST
+const safeTxt = (s) => String(s || '').replace(/[,()*%\\"']/g, ' ').trim().slice(0, 80);
 
 // ---------- rate limit en memoria ----------
 const hits = new Map();
@@ -28,6 +30,120 @@ function limit(key, max, ms) {
   if (++h.n > max) throw new HttpError(429, 'Demasiados intentos. Espere unos minutos e intente de nuevo.');
 }
 
+// ---------- caché corta en memoria ----------
+const cache = new Map();
+async function cached(key, ttlMs, fn) {
+  const c = cache.get(key);
+  if (c && c.t > Date.now()) return c.v;
+  const v = await fn();
+  cache.set(key, { t: Date.now() + ttlMs, v });
+  return v;
+}
+const dropCache = (...prefixes) => { for (const k of [...cache.keys()]) if (prefixes.some((p) => k.startsWith(p))) cache.delete(k); };
+
+// ---------- catálogos ----------
+const canonRole = (n) => {
+  const s = norm(n || '');
+  if (s.includes('admin')) return 'ADMINISTRADOR';
+  if (s.includes('coord')) return 'COORDINADOR';
+  if (s.includes('calidad') || s.includes('audit')) return 'CALIDAD / AUDITOR';
+  return String(n || '').toUpperCase();
+};
+const lookups = () => cached('lookups', 60000, async () => {
+  const [regionales, sedes, categorias, roles] = await Promise.all([
+    D.fetchAll('regionales', [['select', 'id,nombre,codigo,activa'], ['order', 'nombre.asc']]),
+    D.fetchAll('sedes', [['select', 'id,regional_id,nombre,ciudad,activa'], ['order', 'nombre.asc']]),
+    D.fetchAll('categorias_activos', [['select', 'id,nombre,codigo'], ['order', 'nombre.asc']]),
+    D.fetchAll('roles', [['select', 'id,nombre']])
+  ]);
+  const m = (a) => new Map(a.map((x) => [x.id, x]));
+  return { regionales, sedes, categorias, roles, R: m(regionales), S: m(sedes), C: m(categorias), ROL: m(roles) };
+});
+
+// ---------- usuarios / contexto ----------
+async function loadUser(uid) {
+  return cached('user:' + uid, 20000, async () => {
+    const rows = await D.select('usuarios', { select: 'id,email,nombre_completo,cargo,rol_id,activo', id: 'eq.' + uid, limit: 1 });
+    const u = rows[0];
+    if (!u || u.activo === false) return null;
+    const L = await lookups();
+    const rol = L.ROL.get(u.rol_id);
+    const regs = await D.select('usuario_regional', { select: 'regional_id', usuario_id: 'eq.' + uid });
+    return { ...u, rol_nombre: canonRole(rol && rol.nombre), regionales: regs.map((r) => r.regional_id) };
+  });
+}
+const userView = (u) => ({ id: u.id, nombre_completo: u.nombre_completo, email: u.email, cargo: u.cargo, rol_id: u.rol_id, rol_nombre: u.rol_nombre, regionales: u.regionales || [] });
+
+const inScope = (c, rid) => c.scope == null || (rid != null && c.scope.includes(rid));
+const assertScope = (c, rid) => { if (!inScope(c, rid)) throw forbid('El recurso pertenece a una regional que no tiene asignada'); };
+// Filtro PostgREST para limitar por regional a los coordinadores
+const scopePair = (c, col = 'regional_id') => (c.scope == null ? [] : [[col, `in.(${c.scope.length ? c.scope.join(',') : '-1'})`]]);
+
+// Índice liviano de todos los activos (para KPIs y conteos), cacheado 20 s
+const assetIndex = () => cached('assetIndex', 20000, () =>
+  D.fetchAll('activos_maestros', [['select', 'id,regional_id,sede_id,categoria_id,responsable_id,codigo_inventario,numero_serie,estado_registro'], ['order', 'id.asc']]));
+const colabsAll = () => cached('colabs', 20000, () =>
+  D.fetchAll('colaboradores', [['select', 'id,documento,nombre_completo,cargo,regional_id,sede_id,estado_vinculacion,fecha_ingreso,fecha_retiro'], ['order', 'nombre_completo.asc']]));
+
+const incompleto = (a) => blank(a.codigo_inventario) || blank(a.numero_serie) || !a.regional_id;
+
+async function enrichActivos(rows) {
+  const L = await lookups();
+  const colabs = await D.byIds('colaboradores', rows.map((a) => a.responsable_id), 'id,nombre_completo,estado_vinculacion');
+  const CM = new Map(colabs.map((k) => [k.id, k]));
+  return rows.map((a) => {
+    const res = CM.get(a.responsable_id), cat = L.C.get(a.categoria_id), reg = L.R.get(a.regional_id), sed = L.S.get(a.sede_id);
+    return {
+      id: a.id, id_origen: a.id_origen, codigo_inventario: a.codigo_inventario || null, numero_serie: a.numero_serie || null,
+      nombre: a.nombre, marca: a.marca || '', modelo: a.modelo || '', descripcion: a.descripcion || '',
+      categoria_id: a.categoria_id, categoria_nombre: cat ? cat.nombre : null, tipo_elemento: a.tipo_elemento || (cat ? cat.nombre : ''),
+      regional_id: a.regional_id, regional_nombre: reg ? reg.nombre : null, sede_id: a.sede_id, sede_nombre: sed ? sed.nombre : null,
+      ubicacion_especifica: a.ubicacion_especifica || '', responsable_id: a.responsable_id,
+      responsable_nombre: res ? res.nombre_completo : null, responsable_estado: res ? res.estado_vinculacion : null,
+      estado_fisico: a.estado_fisico, estado_operativo: a.estado_operativo, estado_registro: a.estado_registro,
+      es_incompleto: incompleto(a)
+    };
+  });
+}
+async function getActivo(id) {
+  if (!UUID.test(String(id))) return null;
+  const r = await D.select('activos_maestros', { select: ASSET_COLS, id: 'eq.' + id, limit: 1 });
+  return r[0] || null;
+}
+const flagsOf = (a) => ({ es_incompleto: incompleto(a), sin_serial: blank(a.numero_serie), sin_codigo: blank(a.codigo_inventario), sin_regional: !a.regional_id });
+
+// ---------- efectos secundarios tolerantes a fallos ----------
+async function logError(nivel, modulo, mensaje, detalle, userId, endpoint, ip) {
+  try {
+    await D.insert('logs_errores', { nivel, modulo, endpoint: endpoint || null, mensaje: String(mensaje).slice(0, 500), detalle_tecnico: String(detalle || '').slice(0, 3000), usuario_id: userId || null, ip: ip || null, resuelto: false }, false);
+  } catch (e) { console.error('No se pudo registrar el log:', e.message); }
+}
+async function safe(c, etiqueta, fn) {
+  try { return await fn(); }
+  catch (e) {
+    console.error(etiqueta, e.message);
+    await logError('WARN', 'BACKEND', `${etiqueta}: ${e.message}`, e.stack, c.user && c.user.id, c.path, c.ip);
+    (c.advertencias = c.advertencias || []).push(etiqueta);
+    return null;
+  }
+}
+// Notifica a usuarios por rol / regional
+async function notify(c, { titulo, mensaje, tipo = 'INFO', roles = null, regional_id = null }) {
+  return safe(c, 'notificación', async () => {
+    const users = await cached('allusers', 60000, async () => {
+      const [us, ur, L] = await Promise.all([
+        D.fetchAll('usuarios', [['select', 'id,rol_id,activo']]), D.fetchAll('usuario_regional', [['select', 'usuario_id,regional_id']]), lookups()
+      ]);
+      return us.filter((u) => u.activo !== false).map((u) => ({ id: u.id, rol: canonRole((L.ROL.get(u.rol_id) || {}).nombre), regs: ur.filter((x) => x.usuario_id === u.id).map((x) => x.regional_id) }));
+    });
+    const targets = users.filter((u) => (!roles || roles.includes(u.rol)) && (regional_id == null || u.rol !== 'COORDINADOR' || u.regs.includes(regional_id)));
+    if (!targets.length) return;
+    await D.insert('notificaciones', targets.map((u) => ({ usuario_id: u.id, titulo, mensaje, tipo, leida: false })), false);
+  });
+}
+const hist = (c, tabla, registro, accion, antes, despues) =>
+  safe(c, 'historial', () => D.insert('historial_cambios', { tabla, registro_id: String(registro), accion, usuario_id: c.user ? c.user.id : null, datos_anteriores: antes || null, datos_nuevos: despues || null }, false));
+
 // ---------- router ----------
 const routes = [];
 function route(method, pattern, handler, opts = {}) {
@@ -36,632 +152,774 @@ function route(method, pattern, handler, opts = {}) {
   routes.push({ method, rx, keys, handler, opts });
 }
 
-// ---------- helpers de dominio ----------
-const roleName = (db, u) => (byId(db.roles, u.rol_id) || {}).nombre;
-const userView = (db, u) => ({
-  id: u.id, nombre_completo: u.nombre_completo, email: u.email, cargo: u.cargo, rol_id: u.rol_id,
-  rol_nombre: roleName(db, u), regionales: u.regionales || []
-});
-const inScope = (c, rid) => c.scope == null || (rid != null && c.scope.includes(rid));
-const assertScope = (c, rid) => { if (!inScope(c, rid)) throw forbid('El recurso pertenece a una regional que no tiene asignada'); };
-
-function activoView(db, a) {
-  const reg = byId(db.regionales, a.regional_id), sed = byId(db.sedes, a.sede_id);
-  const cat = byId(db.categorias, a.categoria_id), res = byId(db.colaboradores, a.responsable_id);
-  return {
-    id: a.id, id_origen: a.id_origen, codigo_inventario: a.codigo_inventario || null, numero_serie: a.numero_serie || null,
-    nombre: a.nombre, marca: a.marca || '', modelo: a.modelo || '', categoria_id: a.categoria_id,
-    categoria_nombre: cat ? cat.nombre : null, tipo_elemento: cat ? cat.nombre : '',
-    regional_id: a.regional_id, regional_nombre: reg ? reg.nombre : null, sede_id: a.sede_id, sede_nombre: sed ? sed.nombre : null,
-    ubicacion_especifica: a.ubicacion_especifica || '', responsable_id: a.responsable_id,
-    responsable_nombre: res ? res.nombre_completo : null, responsable_estado: res ? res.estado_vinculacion : null,
-    estado_fisico: a.estado_fisico, estado_operativo: a.estado_operativo, estado_registro: a.estado_registro,
-    observaciones: a.observaciones || '', es_incompleto: !a.codigo_inventario || !a.numero_serie || !a.regional_id
-  };
-}
-const visibleActivos = (c) => c.db.activos.filter((a) => c.scope == null || (a.regional_id && c.scope.includes(a.regional_id)));
-const findActivo = (db, id) => db.activos.find((a) => a.id === String(id));
-const movView = (db, m) => {
-  const a = findActivo(db, m.activo_id), ra = byId(db.colaboradores, m.resp_ant_id), rn = byId(db.colaboradores, m.resp_nvo_id), u = byId(db.usuarios, m.usuario_id);
-  return {
-    id: m.id, fecha: m.fecha, activo_id: m.activo_id, activo_nombre: a ? a.nombre : 'Activo', codigo_inventario: a ? a.codigo_inventario : '',
-    tipo_movimiento: m.tipo_movimiento, motivo: m.motivo, resp_ant_nombre: ra ? ra.nombre_completo : null,
-    resp_nvo_nombre: rn ? rn.nombre_completo : null, ubicacion_anterior: m.ubicacion_anterior, ubicacion_nueva: m.ubicacion_nueva,
-    usuario_nombre: u ? u.nombre_completo : 'Sistema'
-  };
-};
-function addMov(db, a, tipo, motivo, o = {}) {
-  db.movimientos.push({
-    id: nextId(db.movimientos), activo_id: a.id, fecha: nowCO(), tipo_movimiento: tipo, motivo,
-    resp_ant_id: o.resp_ant_id || null, resp_nvo_id: o.resp_nvo_id || null,
-    ubicacion_anterior: o.ubic_ant || null, ubicacion_nueva: o.ubic_nva || null, usuario_id: o.usuario_id || null
-  });
-}
-function notify(db, { titulo, mensaje, roles = null, regional_id = null, usuario_id = null }) {
-  db.notificaciones.push({ id: nextId(db.notificaciones), usuario_id, roles, regional_id, titulo, mensaje, created_at: nowCO(), leida_por: [], link: null });
-  if (db.notificaciones.length > 300) db.notificaciones.splice(0, db.notificaciones.length - 300);
-}
-function logError(db, nivel, modulo, mensaje, detalle, usuario) {
-  db.errores.push({ id: nextId(db.errores), fecha: nowCO(), nivel, modulo, mensaje: String(mensaje).slice(0, 500), detalle_tecnico: String(detalle || '').slice(0, 3000), resuelto: false, notas_solucion: null, resuelto_por: null, usuario: usuario || null });
-  if (db.errores.length > 500) db.errores.splice(0, db.errores.length - 500);
-}
-
-// Jornadas
-function jornadaEstado(j) {
-  const t = todayCO();
-  if (j.finalizada) return 'FINALIZADO';
-  if (j.meta_verificacion > 0 && j.verificados.length >= j.meta_verificacion) return 'FINALIZADO';
-  if (t > j.fecha_fin) return 'VENCIDO';
-  if (t >= j.fecha_inicio) return 'EN EJECUCION';
-  return 'PROGRAMADO';
-}
-function jornadaView(db, j) {
-  const reg = byId(db.regionales, j.regional_id), coord = byId(db.usuarios, j.coordinador_id);
-  const total = db.activos.filter((a) => a.regional_id === j.regional_id && (!j.sedes_ids.length || j.sedes_ids.includes(a.sede_id))).length;
-  const meta = j.meta_verificacion || total;
-  return {
-    id: j.id, titulo: j.titulo, tipo_actividad: j.tipo_actividad, regional_id: j.regional_id, regional_nombre: reg ? reg.nombre : '-',
-    sedes: j.sedes_ids.map((id) => byId(db.sedes, id)).filter(Boolean).map((s) => ({ id: s.id, nombre: s.nombre })),
-    fecha_inicio: j.fecha_inicio, fecha_fin: j.fecha_fin, hora_inicio: j.hora_inicio, hora_fin: j.hora_fin,
-    coordinador_nombre: coord ? coord.nombre_completo : null, activos_verificados: j.verificados.length,
-    meta_verificacion: j.meta_verificacion, total_activos_sede: total,
-    porcentaje_avance: meta ? Math.min(100, Math.round((j.verificados.length / meta) * 100)) : 0, estado: jornadaEstado(j)
-  };
-}
-function registrarVerificacion(db, a) {
-  for (const j of db.jornadas) {
-    if (j.regional_id === a.regional_id && jornadaEstado(j) === 'EN EJECUCION' && (!j.sedes_ids.length || j.sedes_ids.includes(a.sede_id)) && !j.verificados.includes(a.id)) j.verificados.push(a.id);
-  }
-}
-const hallazgoView = (db, h) => {
-  const a = findActivo(db, h.activo_id), au = byId(db.auditorias, h.auditoria_id), reg = byId(db.regionales, h.regional_id), sed = byId(db.sedes, h.sede_id);
-  return {
-    id: h.id, codigo: h.codigo, auditoria_codigo: au ? au.codigo : null, descripcion: h.descripcion, activo_nombre: a ? a.nombre : '',
-    codigo_inventario: a ? a.codigo_inventario || '' : '', regional_nombre: reg ? reg.nombre : '-', sede_nombre: sed ? sed.nombre : '',
-    criticidad: h.criticidad, fecha_compromiso: h.fecha_compromiso, estado: h.estado, accion_realizada: h.accion_realizada, evidencia_correccion: h.evidencia_correccion
-  };
-};
-const auditoriaPct = (au) => {
-  let si = 0, no = 0;
-  Object.values(au.evaluaciones).forEach((e) => { si += e.si; no += e.no; });
-  return si + no ? Math.round((si / (si + no)) * 1000) / 10 : 100;
-};
-function auditoriaView(db, au) {
-  const reg = byId(db.regionales, au.regional_id), sed = byId(db.sedes, au.sede_id), aud = byId(db.usuarios, au.auditor_id);
-  return {
-    id: au.id, codigo: au.codigo, titulo: au.titulo, regional_id: au.regional_id, regional_nombre: reg ? reg.nombre : '-',
-    sede_id: au.sede_id, sede_nombre: sed ? sed.nombre : null, tipo_alcance: au.tipo_alcance, fecha_programada: au.fecha_programada,
-    auditor_nombre: aud ? aud.nombre_completo : '-', porcentaje_cumplimiento: auditoriaPct(au),
-    total_hallazgos: db.hallazgos.filter((h) => h.auditoria_id === au.id).length, estado: au.estado, resultado_final: au.resultado_final,
-    evaluados: Object.keys(au.evaluaciones).length, total_activos: au.detalle_ids.length
-  };
-}
-
 // ============================================================================
-// SALUD
+// SALUD / DIAGNÓSTICO
 // ============================================================================
-route('GET', '/api/health', () => ({ ok: true, servicio: 'Jardines del Renacer API', persistencia: persistence(), hora: nowCO() }), { public: true });
+route('GET', '/api/health', async () => {
+  const out = {
+    ok: true, servicio: 'Jardines del Renacer API', hora: new Date().toISOString(),
+    supabase_url: !!process.env.SUPABASE_URL, supabase_key: !!(process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY),
+    jwt_secret: !!process.env.JWT_SECRET
+  };
+  try { const r = await D.rest('GET', 'activos_maestros', { params: { select: 'id', limit: 1 }, count: true }); out.base_de_datos = 'conectada'; out.total_activos = r.count; }
+  catch (e) { out.ok = false; out.base_de_datos = 'error'; out.detalle = e.message; }
+  return out;
+}, { public: true });
 
 // ============================================================================
 // AUTENTICACIÓN
 // ============================================================================
-route('POST', '/api/auth/login', (c) => {
+route('POST', '/api/auth/login', async (c) => {
   limit('login:' + c.ip, 20, 5 * 60 * 1000);
   const id = String(c.body.email || '').trim().toLowerCase(), pw = String(c.body.password || '');
   if (!id || !pw) throw bad('Ingrese usuario y contraseña');
-  const u = c.db.usuarios.find((x) => x.activo && (x.email.toLowerCase() === id || x.email.toLowerCase().split('@')[0] === id));
-  if (!u || !verifyPassword(pw, u.pass)) throw bad('Usuario o contraseña incorrectos');
-  return { token: signToken({ uid: u.id }), user: userView(c.db, u) };
+  const pattern = (id.includes('@') ? id : id + '@%').replace(/[,()*\\"]/g, '');
+  const rows = await D.select('usuarios', { select: 'id,email,password_hash,activo', email: 'ilike.' + pattern, limit: 5 });
+  const u = rows.find((x) => x.activo !== false && (x.email.toLowerCase() === id || x.email.toLowerCase().split('@')[0] === id));
+  if (!u || !verifyPassword(pw, u.password_hash)) throw bad('Usuario o contraseña incorrectos');
+  dropCache('user:' + u.id);
+  const full = await loadUser(u.id);
+  return { token: signToken({ uid: u.id }), user: userView(full) };
 }, { public: true });
 
-route('POST', '/api/auth/register', (c) => {
+route('POST', '/api/auth/register', async (c) => {
   limit('register:' + c.ip, 10, 60 * 60 * 1000);
-  const b = c.body, db = c.db;
-  const email = String(b.email || '').trim().toLowerCase(), nombre = String(b.nombre_completo || '').trim();
-  const password = String(b.password || '');
+  const b = c.body;
+  const email = String(b.email || '').trim().toLowerCase(), nombre = String(b.nombre_completo || '').trim(), password = String(b.password || '');
   if (!nombre || !email || !password) throw bad('Complete nombre, correo y contraseña');
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw bad('Correo electrónico inválido');
   if (EMAIL_DOMAIN !== '*' && !email.endsWith('@' + EMAIL_DOMAIN)) throw bad(`Use su correo corporativo (@${EMAIL_DOMAIN})`);
   if (password.length < 6) throw bad('La contraseña debe tener al menos 6 caracteres');
-  if (db.usuarios.some((u) => u.email.toLowerCase() === email)) throw new HttpError(409, 'Ya existe un usuario con ese correo');
-  const rol = toInt(b.rol_id) || 2;
-  if (rol === 1) throw forbid('El rol Administrador requiere aprobación: solicítelo a un administrador existente');
-  if (![2, 3].includes(rol)) throw bad('Rol inválido');
+  const dup = await D.select('usuarios', { select: 'id', email: 'ilike.' + email.replace(/[,()*\\"%_]/g, '_'), limit: 1 });
+  if (dup.length) throw new HttpError(409, 'Ya existe un usuario con ese correo');
+  const wanted = { 1: 'ADMINISTRADOR', 2: 'COORDINADOR', 3: 'CALIDAD / AUDITOR' }[toInt(b.rol_id) || 2];
+  if (wanted === 'ADMINISTRADOR') throw forbid('El rol Administrador requiere aprobación: solicítelo a un administrador existente');
+  if (!wanted) throw bad('Rol inválido');
+  const L = await lookups();
+  const rol = L.roles.find((r) => canonRole(r.nombre) === wanted);
+  if (!rol) throw bad('El rol solicitado no existe en la base de datos');
   const regional = toInt(b.regional_id);
-  if (rol === 2 && !byId(db.regionales, regional)) throw bad('El coordinador debe tener una regional asignada');
-  const u = {
-    id: nextId(db.usuarios), nombre_completo: nombre, email, cargo: b.cargo || '', rol_id: rol,
-    regionales: rol === 2 ? [regional] : [], pass: hashPassword(password), activo: true
-  };
-  db.usuarios.push(u);
-  notify(db, { titulo: 'Nuevo usuario registrado', mensaje: `${nombre} (${roleName(db, u)}) creó su cuenta.`, roles: ['ADMINISTRADOR'] });
-  return { token: signToken({ uid: u.id }), user: userView(db, u) };
+  if (wanted === 'COORDINADOR' && !L.R.get(regional)) throw bad('El coordinador debe tener una regional asignada');
+  const id = crypto.randomUUID();
+  await D.insert('usuarios', { id, email, password_hash: hashPassword(password), nombre_completo: nombre, cargo: str(b.cargo, 120), rol_id: rol.id, activo: true }, false);
+  if (wanted === 'COORDINADOR') await D.insert('usuario_regional', { usuario_id: id, regional_id: regional }, false);
+  dropCache('allusers');
+  const full = await loadUser(id);
+  c.user = full;
+  await notify(c, { titulo: 'Nuevo usuario registrado', mensaje: `${nombre} (${wanted}) creó su cuenta.`, roles: ['ADMINISTRADOR'] });
+  return { token: signToken({ uid: id }), user: userView(full) };
 }, { public: true });
 
-route('GET', '/api/auth/me', (c) => ({ user: userView(c.db, c.user) }));
+route('GET', '/api/auth/me', (c) => ({ user: userView(c.user) }));
 
 // ============================================================================
 // CATÁLOGOS
 // ============================================================================
-route('GET', '/api/regionales', (c) => ({
-  regionales: c.db.regionales.map((r) => ({
-    ...r, total_sedes: c.db.sedes.filter((s) => s.regional_id === r.id).length,
-    total_activos: c.db.activos.filter((a) => a.regional_id === r.id).length
-  }))
-}));
-route('GET', '/api/sedes', (c) => ({ sedes: c.db.sedes }));
-route('GET', '/api/categorias', (c) => ({ categorias: c.db.categorias }));
+route('GET', '/api/regionales', async () => {
+  const [L, idx] = await Promise.all([lookups(), assetIndex()]);
+  return {
+    regionales: L.regionales.filter((r) => r.activa !== false).map((r) => ({
+      id: r.id, nombre: r.nombre, codigo: r.codigo,
+      total_sedes: L.sedes.filter((s) => s.regional_id === r.id && s.activa !== false).length,
+      total_activos: idx.filter((a) => a.regional_id === r.id).length
+    }))
+  };
+});
+route('GET', '/api/sedes', async () => ({ sedes: (await lookups()).sedes.filter((s) => s.activa !== false).map(({ id, regional_id, nombre, ciudad }) => ({ id, regional_id, nombre, ciudad })) }));
+route('GET', '/api/categorias', async () => ({ categorias: (await lookups()).categorias.map(({ id, nombre, codigo }) => ({ id, nombre, codigo })) }));
 
 // ============================================================================
 // DASHBOARD
 // ============================================================================
-route('GET', '/api/dashboard', (c) => {
-  const db = c.db, act = visibleActivos(c);
-  const views = act.map((a) => activoView(db, a));
-  const regs = db.regionales.filter((r) => inScope(c, r.id));
-  const auds = db.auditorias.filter((a) => inScope(c, a.regional_id));
-  const evaluadas = auds.filter((a) => Object.keys(a.evaluaciones).length);
-  const jor = db.jornadas.filter((j) => inScope(c, j.regional_id));
+route('GET', '/api/dashboard', async (c) => {
+  const [L, idx, colabs] = await Promise.all([lookups(), assetIndex(), colabsAll()]);
+  const act = c.scope == null ? idx : idx.filter((a) => a.regional_id && c.scope.includes(a.regional_id));
+  const retirados = new Set(colabs.filter(isRetirado).map((k) => k.id));
+  const cnt = async (table, extra) => (await D.rest('GET', table, { params: [['select', 'id'], ['limit', 1], ...extra], count: true })).count || 0;
+  const [abiertos, totalAud, totalJor, auds, jors] = await Promise.all([
+    cnt('hallazgos', [['estado', 'neq.CERRADO'], ...scopePair(c)]),
+    cnt('auditorias', scopePair(c)),
+    cnt('programaciones', scopePair(c)),
+    D.select('auditorias', [['select', 'porcentaje_cumplimiento'], ['porcentaje_cumplimiento', 'not.is.null'], ...scopePair(c), ['limit', 1000]]),
+    D.select('programaciones', [['select', 'id,fecha_inicio,fecha_fin,estado'], ...scopePair(c), ['limit', 1000]])
+  ]);
+  const hoy = todayCO();
+  const enEj = jors.filter((j) => !/finaliz|cancel/i.test(j.estado || '') && hoy >= j.fecha_inicio && hoy <= j.fecha_fin).length;
+  const prom = auds.length ? auds.reduce((s, a) => s + Number(a.porcentaje_cumplimiento || 0), 0) / auds.length : null;
+  const regs = L.regionales.filter((r) => r.activa !== false && inScope(c, r.id));
   return {
     activos_kpis: {
-      total_activos: views.length,
-      incompletos: views.filter((v) => v.es_incompleto).length,
-      sin_serial: views.filter((v) => !v.numero_serie).length,
-      sin_codigo: views.filter((v) => !v.codigo_inventario).length,
-      sin_regional: views.filter((v) => !v.regional_id).length,
-      nuevos: views.filter((v) => String(v.estado_registro).startsWith('NUEVO')).length,
-      activos_en_retirados: views.filter((v) => v.responsable_estado === 'RETIRADO').length
+      total_activos: act.length, incompletos: act.filter(incompleto).length,
+      sin_serial: act.filter((a) => blank(a.numero_serie)).length, sin_codigo: act.filter((a) => blank(a.codigo_inventario)).length,
+      sin_regional: act.filter((a) => !a.regional_id).length, nuevos: act.filter((a) => /^NUEVO/i.test(a.estado_registro || '')).length,
+      activos_en_retirados: act.filter((a) => retirados.has(a.responsable_id)).length
     },
-    calidad_kpis: {
-      total_auditorias: auds.length,
-      promedio_cumplimiento: evaluadas.length ? evaluadas.reduce((s, a) => s + auditoriaPct(a), 0) / evaluadas.length : null
-    },
-    hallazgos_kpis: { abiertos: db.hallazgos.filter((h) => h.estado !== 'CERRADO' && inScope(c, h.regional_id)).length },
-    calendario_kpis: { total_jornadas: jor.length, en_ejecucion: jor.filter((j) => jornadaEstado(j) === 'EN EJECUCION').length },
-    por_regional: regs.map((r) => ({ id: r.id, nombre: r.nombre, cantidad: views.filter((v) => v.regional_id === r.id).length })).sort((a, b) => b.cantidad - a.cantidad),
-    por_categoria: db.categorias.map((k) => ({ id: k.id, nombre: k.nombre, cantidad: views.filter((v) => v.categoria_id === k.id).length })).sort((a, b) => b.cantidad - a.cantidad)
+    calidad_kpis: { total_auditorias: totalAud, promedio_cumplimiento: prom },
+    hallazgos_kpis: { abiertos },
+    calendario_kpis: { total_jornadas: totalJor, en_ejecucion: enEj },
+    por_regional: regs.map((r) => ({ id: r.id, nombre: r.nombre, cantidad: act.filter((a) => a.regional_id === r.id).length })).sort((a, b) => b.cantidad - a.cantidad),
+    por_categoria: L.categorias.map((k) => ({ id: k.id, nombre: k.nombre, cantidad: act.filter((a) => a.categoria_id === k.id).length })).sort((a, b) => b.cantidad - a.cantidad)
   };
 });
 
 // ============================================================================
 // INVENTARIO MAESTRO
 // ============================================================================
-route('GET', '/api/maestro', (c) => {
-  const q = c.q, db = c.db;
-  let items = visibleActivos(c).map((a) => activoView(db, a));
-  const txt = norm(q.q || '');
-  if (txt) items = items.filter((v) => norm([v.nombre, v.codigo_inventario, v.numero_serie, v.marca, v.modelo, v.responsable_nombre, v.regional_nombre, v.sede_nombre].join(' ')).includes(txt));
-  if (q.regional_id) items = items.filter((v) => String(v.regional_id) === q.regional_id);
-  if (q.sede_id) items = items.filter((v) => String(v.sede_id) === q.sede_id);
-  if (q.categoria_id) items = items.filter((v) => String(v.categoria_id) === q.categoria_id);
-  if (q.estado_fisico) items = items.filter((v) => v.estado_fisico === q.estado_fisico);
-  if (q.estado_operativo) items = items.filter((v) => v.estado_operativo === q.estado_operativo);
-  if (q.estado_registro) items = items.filter((v) => v.estado_registro === q.estado_registro);
-  const f = { completos: (v) => !v.es_incompleto, incompletos: (v) => v.es_incompleto, sin_serial: (v) => !v.numero_serie, sin_codigo: (v) => !v.codigo_inventario, sin_regional: (v) => !v.regional_id }[q.integridad];
-  if (f) items = items.filter(f);
+const EMPTY = (col) => `${col}.is.null,${col}.eq.`;
+route('GET', '/api/maestro', async (c) => {
+  const q = c.q;
+  const params = [['select', ASSET_COLS], ['order', 'nombre.asc'], ['order', 'id.asc'], ...scopePair(c)];
+  const clauses = [];
+  const txt = safeTxt(q.q);
+  if (txt) {
+    const cols = ['nombre', 'codigo_inventario', 'numero_serie', 'marca', 'modelo', 'ubicacion_especifica'].map((k) => `${k}.ilike.*${txt}*`);
+    const ks = await D.select('colaboradores', { select: 'id', nombre_completo: `ilike.*${txt}*`, limit: 100 });
+    if (ks.length) cols.push(`responsable_id.in.(${ks.map((k) => k.id).join(',')})`);
+    clauses.push(`or(${cols.join(',')})`);
+  }
+  if (q.regional_id && toInt(q.regional_id)) params.push(['regional_id', 'eq.' + toInt(q.regional_id)]);
+  if (q.sede_id && toInt(q.sede_id)) params.push(['sede_id', 'eq.' + toInt(q.sede_id)]);
+  if (q.categoria_id && toInt(q.categoria_id)) params.push(['categoria_id', 'eq.' + toInt(q.categoria_id)]);
+  if (q.estado_fisico) params.push(['estado_fisico', 'eq.' + safeTxt(q.estado_fisico)]);
+  if (q.estado_operativo) params.push(['estado_operativo', 'eq.' + safeTxt(q.estado_operativo)]);
+  if (q.estado_registro) params.push(['estado_registro', 'eq.' + safeTxt(q.estado_registro)]);
+  switch (q.integridad) {
+    case 'sin_serial': clauses.push(`or(${EMPTY('numero_serie')})`); break;
+    case 'sin_codigo': clauses.push(`or(${EMPTY('codigo_inventario')})`); break;
+    case 'sin_regional': params.push(['regional_id', 'is.null']); break;
+    case 'incompletos': clauses.push(`or(${EMPTY('codigo_inventario')},${EMPTY('numero_serie')},regional_id.is.null)`); break;
+    case 'completos': clauses.push('codigo_inventario.not.is.null', 'codigo_inventario.neq.', 'numero_serie.not.is.null', 'numero_serie.neq.', 'regional_id.not.is.null'); break;
+    default: break;
+  }
+  if (clauses.length) params.push(['and', `(${clauses.join(',')})`]);
   const size = Math.min(100, Math.max(1, toInt(q.page_size) || 15));
-  const total = items.length, pages = Math.max(1, Math.ceil(total / size));
-  const page = Math.min(pages, Math.max(1, toInt(q.page) || 1));
-  return { items: items.slice((page - 1) * size, page * size), total, page, page_size: size, total_pages: pages };
+  const pageReq = Math.max(1, toInt(q.page) || 1);
+  params.push(['limit', size], ['offset', (pageReq - 1) * size]);
+  const { data, count } = await D.rest('GET', 'activos_maestros', { params, count: true });
+  const total = count == null ? (data || []).length : count;
+  return { items: await enrichActivos(data || []), total, page: pageReq, page_size: size, total_pages: Math.max(1, Math.ceil(total / size)) };
 });
 
 route('GET', '/api/maestro/export', (c) => csvReport(c, 1));
 
-route('GET', '/api/maestro/:id', (c) => {
-  const a = findActivo(c.db, c.params.id);
+route('GET', '/api/maestro/:id', async (c) => {
+  const a = await getActivo(c.params.id);
   if (!a) throw notFound('Activo no encontrado');
   assertScope(c, a.regional_id);
-  const v = activoView(c.db, a);
-  v.movimientos = c.db.movimientos.filter((m) => m.activo_id === a.id).sort((x, y) => (y.fecha > x.fecha ? 1 : -1)).map((m) => movView(c.db, m));
-  v.fotografias = c.db.fotografias.filter((f) => f.activo_id === a.id);
+  const [v] = await enrichActivos([a]);
+  const [movs, fotos] = await Promise.all([
+    D.select('movimientos', { select: '*', activo_id: 'eq.' + a.id, order: 'fecha.desc', limit: 100 }),
+    D.select('fotografias_activos', { select: 'id,tipo_foto,url_o_base64,descripcion', activo_id: 'eq.' + a.id, order: 'id.desc', limit: 20 })
+  ]);
+  v.movimientos = await movViews(movs);
+  v.fotografias = fotos;
   return { activo: v };
 });
 
-route('POST', '/api/activos/search-first', (c) => {
-  const t = norm(c.body.q || '');
+route('POST', '/api/activos/search-first', async (c) => {
+  const t = safeTxt(c.body.q);
   if (!t) throw bad('Ingrese un término de búsqueda');
-  const res = visibleActivos(c).map((a) => activoView(c.db, a)).filter((v) => norm([v.codigo_inventario, v.numero_serie, v.nombre, v.marca, v.modelo].join(' ')).includes(t));
-  return { coincidencias: res.slice(0, 10) };
+  const cols = ['codigo_inventario', 'numero_serie', 'nombre', 'marca', 'modelo'].map((k) => `${k}.ilike.*${t}*`).join(',');
+  const rows = await D.select('activos_maestros', [['select', ASSET_COLS], ['or', `(${cols})`], ...scopePair(c), ['order', 'nombre.asc'], ['limit', 10]]);
+  return { coincidencias: await enrichActivos(rows) };
 });
 
-route('POST', '/api/activos/create', (c) => {
-  const b = c.body, db = c.db;
-  const nombre = String(b.nombre || '').trim();
+// Registra una verificación física (inventarios_fisicos) ligada a la jornada activa, si existe
+async function registrarInventarioFisico(c, a, extra = {}) {
+  return safe(c, 'inventario físico', async () => {
+    const hoy = todayCO();
+    if (!a.regional_id) {
+      await D.insert('inventarios_fisicos', { activo_id: a.id, fecha_verificacion: nowISO(), usuario_id: c.user.id, observaciones: extra.observaciones || null, coincide_maestro: false }, false);
+      return;
+    }
+    const progs = await D.select('programaciones', { select: 'id,estado', regional_id: 'eq.' + a.regional_id, fecha_inicio: 'lte.' + hoy, fecha_fin: 'gte.' + hoy, order: 'id.desc', limit: 5 });
+    const prog = progs.find((p) => !/finaliz|cancel/i.test(p.estado || ''));
+    let progId = null;
+    if (prog) {
+      const ps = await D.select('programacion_sedes', { select: 'sede_id', programacion_id: 'eq.' + prog.id });
+      if (!ps.length || ps.some((x) => x.sede_id === a.sede_id)) progId = prog.id;
+    }
+    await D.insert('inventarios_fisicos', {
+      activo_id: a.id, programacion_id: progId, fecha_verificacion: nowISO(), usuario_id: c.user.id, regional_id: a.regional_id, sede_id: a.sede_id,
+      ubicacion_especifica: a.ubicacion_especifica || null, responsable_id: a.responsable_id || null, estado_fisico: a.estado_fisico || null,
+      estado_operativo: a.estado_operativo || null, coincide_maestro: extra.coincide !== false, observaciones: extra.observaciones || null
+    }, false);
+  });
+}
+
+route('POST', '/api/activos/create', async (c) => {
+  const b = c.body;
+  const nombre = str(b.nombre, 200).trim();
   if (!nombre) throw bad('El nombre del activo es obligatorio');
-  const regional = toInt(b.regional_id), sede = toInt(b.sede_id);
-  if (regional) { if (!byId(db.regionales, regional)) throw bad('Regional inválida'); assertScope(c, regional); }
+  const L = await lookups();
+  const regional = toInt(b.regional_id), sede = toInt(b.sede_id), categoria = toInt(b.categoria_id);
+  if (regional) { if (!L.R.get(regional)) throw bad('Regional inválida'); assertScope(c, regional); }
   else if (c.scope) throw bad('Debe seleccionar una regional');
-  if (sede && (!byId(db.sedes, sede) || byId(db.sedes, sede).regional_id !== regional)) throw bad('La sede no pertenece a la regional seleccionada');
-  const codigo = String(b.codigo_inventario || '').trim() || null, serie = String(b.numero_serie || '').trim() || null;
-  if (codigo && db.activos.some((a) => a.codigo_inventario && a.codigo_inventario.toLowerCase() === codigo.toLowerCase())) throw new HttpError(409, 'Ya existe un activo con ese código de inventario. Use la consulta previa para actualizarlo.');
-  if (serie && db.activos.some((a) => a.numero_serie && a.numero_serie.toLowerCase() === serie.toLowerCase())) throw new HttpError(409, 'Ya existe un activo con ese número de serie. Use la consulta previa para actualizarlo.');
-  const now = nowCO();
+  if (sede && (!L.S.get(sede) || L.S.get(sede).regional_id !== regional)) throw bad('La sede no pertenece a la regional seleccionada');
+  const codigo = str(b.codigo_inventario, 80).trim() || null, serie = str(b.numero_serie, 120).trim() || null;
+  for (const [col, val, label] of [['codigo_inventario', codigo, 'código de inventario'], ['numero_serie', serie, 'número de serie']]) {
+    if (!val) continue;
+    const d = await D.select('activos_maestros', { select: 'id', [col]: 'ilike.' + val.replace(/[,()*%_\\"]/g, '_'), limit: 5 });
+    if (d.length) throw new HttpError(409, `Ya existe un activo con ese ${label}. Use la consulta previa para actualizarlo.`);
+  }
   const a = {
-    id: crypto.randomUUID(), id_origen: null, codigo_inventario: codigo, numero_serie: serie, nombre,
-    categoria_id: toInt(b.categoria_id), marca: b.marca || '', modelo: b.modelo || '', regional_id: regional, sede_id: sede || null,
-    ubicacion_especifica: b.ubicacion_especifica || '', responsable_id: null,
-    estado_fisico: ESTADOS_FISICOS.includes(b.estado_fisico) ? b.estado_fisico : 'BUENO', estado_operativo: 'OPERATIVO',
-    estado_registro: 'NUEVO - PENDIENTE DE VALIDACIÓN', observaciones: b.observaciones || '', verificado_en: null, created_at: now, updated_at: now
+    id: crypto.randomUUID(), id_origen: null, codigo_inventario: codigo, numero_serie: serie, nombre, descripcion: str(b.observaciones, 1000) || null,
+    categoria_id: categoria, tipo_elemento: (L.C.get(categoria) || {}).nombre || null, marca: str(b.marca, 80), modelo: str(b.modelo, 80),
+    regional_id: regional, sede_id: sede || null, dependencia_id: null, ubicacion_especifica: str(b.ubicacion_especifica, 200),
+    responsable_id: null, estado_fisico: str(b.estado_fisico, 40) || 'BUENO', estado_operativo: 'OPERATIVO',
+    estado_registro: 'NUEVO - PENDIENTE DE VALIDACIÓN', origen_csv: false
   };
-  db.activos.push(a);
-  addMov(db, a, 'REGISTRO', b.observaciones || 'Registro de activo nuevo', { ubic_nva: a.ubicacion_especifica, usuario_id: c.user.id });
-  registrarVerificacion(db, a);
-  notify(db, { titulo: 'Nuevo activo pendiente de validación', mensaje: `${nombre} fue registrado por ${c.user.nombre_completo}.`, roles: ['ADMINISTRADOR', 'CALIDAD / AUDITOR'], regional_id: regional });
-  return { message: 'Activo registrado como NUEVO - PENDIENTE DE VALIDACIÓN', activo_id: a.id };
+  Object.assign(a, flagsOf(a));
+  await D.insert('activos_maestros', a, false);
+  dropCache('assetIndex');
+  await safe(c, 'movimiento', () => D.insert('movimientos', { activo_id: a.id, tipo_movimiento: 'REGISTRO', regional_nueva_id: regional, sede_nueva_id: sede || null, ubicacion_nueva: a.ubicacion_especifica, motivo: str(b.observaciones, 500) || 'Registro de activo nuevo', usuario_id: c.user.id }, false));
+  await registrarInventarioFisico(c, a, { coincide: false, observaciones: 'Activo nuevo registrado en campo' });
+  await hist(c, 'activos_maestros', a.id, 'INSERT', null, { nombre, codigo_inventario: codigo, numero_serie: serie });
+  await notify(c, { titulo: 'Nuevo activo pendiente de validación', mensaje: `${nombre} fue registrado por ${c.user.nombre_completo}.`, roles: ['ADMINISTRADOR', 'CALIDAD / AUDITOR'] });
+  return { message: 'Activo registrado como NUEVO - PENDIENTE DE VALIDACIÓN', activo_id: a.id, advertencias: c.advertencias };
 });
 
-route('POST', '/api/activos/update-physical', (c) => {
-  const b = c.body, db = c.db;
-  const a = findActivo(db, b.activo_id);
+route('POST', '/api/activos/update-physical', async (c) => {
+  const b = c.body, L = await lookups();
+  const a = await getActivo(b.activo_id);
   if (!a) throw notFound('Activo no encontrado');
   assertScope(c, a.regional_id);
   const regional = toInt(b.regional_id) || a.regional_id;
-  if (!byId(db.regionales, regional)) throw bad('Regional inválida');
+  if (!L.R.get(regional)) throw bad('Regional inválida');
   assertScope(c, regional);
   let sede = toInt(b.sede_id);
   if (!sede && regional === a.regional_id) sede = a.sede_id;
-  if (sede && (!byId(db.sedes, sede) || byId(db.sedes, sede).regional_id !== regional)) throw bad('La sede no pertenece a la regional seleccionada');
-  const ubic = b.ubicacion_especifica != null ? String(b.ubicacion_especifica) : a.ubicacion_especifica;
-  const fis = ESTADOS_FISICOS.includes(b.estado_fisico) ? b.estado_fisico : a.estado_fisico;
-  const just = b.observaciones || 'Verificación física';
-  const nombreReg = (id) => (byId(db.regionales, id) || {}).nombre || '';
-  const nombreSed = (id) => (byId(db.sedes, id) || {}).nombre || '';
+  if (sede && (!L.S.get(sede) || L.S.get(sede).regional_id !== regional)) throw bad('La sede no pertenece a la regional seleccionada');
+  const ubic = b.ubicacion_especifica != null ? str(b.ubicacion_especifica, 200) : a.ubicacion_especifica || '';
+  const fis = b.estado_fisico ? str(b.estado_fisico, 40) : a.estado_fisico;
+  const just = str(b.observaciones, 500) || 'Verificación física';
+  const nr = (id) => (L.R.get(id) || {}).nombre || '', ns = (id) => (L.S.get(id) || {}).nombre || '';
   const cambios = [];
-  if (regional !== a.regional_id) cambios.push(['regional', nombreReg(a.regional_id), nombreReg(regional)]);
-  if ((sede || null) !== (a.sede_id || null)) cambios.push(['sede', nombreSed(a.sede_id), nombreSed(sede)]);
-  if (ubic !== (a.ubicacion_especifica || '')) cambios.push(['ubicacion_especifica', a.ubicacion_especifica, ubic]);
-  if (fis !== a.estado_fisico) cambios.push(['estado_fisico', a.estado_fisico, fis]);
-  const ubicAnt = a.ubicacion_especifica;
-  const regAnt = a.regional_id;
-  a.regional_id = regional; a.sede_id = sede || null; a.ubicacion_especifica = ubic; a.estado_fisico = fis;
-  a.verificado_en = nowCO(); a.updated_at = a.verificado_en;
-  if (cambios.length && String(a.estado_registro).startsWith('NUEVO') === false) a.estado_registro = 'VALIDADO';
-  cambios.forEach(([campo, ant, nvo]) => db.novedades.push({
-    id: nextId(db.novedades), activo_id: a.id, fecha: nowCO(), campo_modificado: campo, valor_anterior: ant, valor_nuevo: nvo,
-    justificacion: just, estado: 'REGISTRADA', regional_id: regAnt, usuario_id: c.user.id
-  }));
-  const traslado = cambios.some(([k]) => k === 'regional' || k === 'sede' || k === 'ubicacion_especifica');
-  addMov(db, a, traslado ? 'TRASLADO' : 'VERIFICACION FISICA', just, { ubic_ant: ubicAnt, ubic_nva: ubic, resp_ant_id: a.responsable_id, resp_nvo_id: a.responsable_id, usuario_id: c.user.id });
-  registrarVerificacion(db, a);
-  return { ok: true, cambios: cambios.length, message: 'Actualización registrada' };
+  if (regional !== a.regional_id) cambios.push(['regional', nr(a.regional_id), nr(regional)]);
+  if ((sede || null) !== (a.sede_id || null)) cambios.push(['sede', ns(a.sede_id), ns(sede)]);
+  if (ubic !== (a.ubicacion_especifica || '')) cambios.push(['ubicacion_especifica', a.ubicacion_especifica || '', ubic]);
+  if (fis !== a.estado_fisico) cambios.push(['estado_fisico', a.estado_fisico || '', fis]);
+  const nuevo = { ...a, regional_id: regional, sede_id: sede || null, ubicacion_especifica: ubic, estado_fisico: fis };
+  await D.update('activos_maestros', { id: 'eq.' + a.id }, { regional_id: nuevo.regional_id, sede_id: nuevo.sede_id, ubicacion_especifica: ubic, estado_fisico: fis, ...flagsOf(nuevo), updated_at: nowISO() });
+  dropCache('assetIndex');
+  if (cambios.length) {
+    await safe(c, 'novedades', () => D.insert('novedades', cambios.map(([campo, ant, nvo]) => ({ activo_id: a.id, tipo_novedad: 'ACTUALIZACION_FISICA', campo_modificado: campo, valor_anterior: ant, valor_nuevo: nvo, justificacion: just, usuario_id: c.user.id, estado: 'REGISTRADA' })), false));
+  }
+  const traslado = cambios.some(([k]) => k !== 'estado_fisico');
+  await safe(c, 'movimiento', () => D.insert('movimientos', {
+    activo_id: a.id, tipo_movimiento: traslado ? 'TRASLADO' : 'VERIFICACION FISICA', responsable_anterior_id: a.responsable_id, responsable_nuevo_id: a.responsable_id,
+    regional_anterior_id: a.regional_id, regional_nueva_id: regional, sede_anterior_id: a.sede_id, sede_nueva_id: sede || null,
+    ubicacion_anterior: a.ubicacion_especifica || null, ubicacion_nueva: ubic, motivo: just, usuario_id: c.user.id
+  }, false));
+  await registrarInventarioFisico(c, nuevo, { coincide: cambios.length === 0, observaciones: just });
+  if (cambios.length) await hist(c, 'activos_maestros', a.id, 'UPDATE', { regional_id: a.regional_id, sede_id: a.sede_id, ubicacion_especifica: a.ubicacion_especifica, estado_fisico: a.estado_fisico }, { regional_id: regional, sede_id: sede || null, ubicacion_especifica: ubic, estado_fisico: fis });
+  return { ok: true, cambios: cambios.length, message: 'Actualización registrada', advertencias: c.advertencias };
 });
 
 // ============================================================================
 // COLABORADORES
 // ============================================================================
-const totalActivosDe = (db, id) => db.activos.filter((a) => a.responsable_id === id).length;
-const colabView = (db, k) => ({
-  ...k, regional_nombre: (byId(db.regionales, k.regional_id) || {}).nombre || null, sede_nombre: (byId(db.sedes, k.sede_id) || {}).nombre || null,
-  total_activos: totalActivosDe(db, k.id)
+const colabsScoped = async (c) => (await colabsAll()).filter((k) => c.scope == null || (k.regional_id && c.scope.includes(k.regional_id)));
+async function colabViews(list) {
+  const [L, idx] = await Promise.all([lookups(), assetIndex()]);
+  const counts = new Map();
+  idx.forEach((a) => { if (a.responsable_id) counts.set(a.responsable_id, (counts.get(a.responsable_id) || 0) + 1); });
+  return list.map((k) => ({
+    ...k, regional_nombre: (L.R.get(k.regional_id) || {}).nombre || null, sede_nombre: (L.S.get(k.sede_id) || {}).nombre || null, total_activos: counts.get(k.id) || 0
+  }));
+}
+
+route('GET', '/api/colaboradores', async (c) => ({ colaboradores: await colabViews(await colabsScoped(c)) }));
+
+route('GET', '/api/colaboradores/retirados-con-activos', async (c) => {
+  const v = await colabViews((await colabsScoped(c)).filter(isRetirado));
+  return { retirados: v.filter((k) => k.total_activos > 0).map((k) => ({ ...k, activos_pendientes: k.total_activos })) };
 });
 
-route('GET', '/api/colaboradores', (c) => ({
-  colaboradores: c.db.colaboradores.filter((k) => c.scope == null || (k.regional_id && c.scope.includes(k.regional_id))).map((k) => colabView(c.db, k)).sort((a, b) => a.nombre_completo.localeCompare(b.nombre_completo))
-}));
-
-route('GET', '/api/colaboradores/retirados-con-activos', (c) => ({
-  retirados: c.db.colaboradores.filter((k) => k.estado_vinculacion === 'RETIRADO' && inScope(c, k.regional_id)).map((k) => ({ ...colabView(c.db, k), activos_pendientes: totalActivosDe(c.db, k.id) })).filter((k) => k.activos_pendientes > 0)
-}));
-
-route('POST', '/api/colaboradores/reasignar-activos', (c) => {
-  const db = c.db, origen = toInt(c.body.colaborador_origen_id), destino = toInt(c.body.colaborador_destino_id);
-  const o = byId(db.colaboradores, origen);
-  if (!o) throw notFound('Colaborador origen no encontrado');
-  assertScope(c, o.regional_id);
-  const d = destino ? byId(db.colaboradores, destino) : null;
-  if (destino && (!d || d.estado_vinculacion !== 'ACTIVO')) throw bad('El colaborador destino no existe o no está activo');
-  const lista = db.activos.filter((a) => a.responsable_id === o.id);
-  lista.forEach((a) => {
-    a.responsable_id = d ? d.id : null;
-    if (!d) a.estado_operativo = 'EN BODEGA';
-    a.updated_at = nowCO();
-    addMov(db, a, d ? 'REASIGNACION' : 'DEVOLUCION', d ? `Reasignación por retiro de ${o.nombre_completo}` : `Devolución a stock por retiro de ${o.nombre_completo}`, { resp_ant_id: o.id, resp_nvo_id: d ? d.id : null, ubic_nva: d ? null : 'Stock disponible', usuario_id: c.user.id });
+route('POST', '/api/colaboradores/reasignar-activos', async (c) => {
+  const origen = toInt(c.body.colaborador_origen_id), destino = toInt(c.body.colaborador_destino_id);
+  const k = (await colabsAll()).find((x) => x.id === origen);
+  if (!k) throw notFound('Colaborador origen no encontrado');
+  assertScope(c, k.regional_id);
+  let d = null;
+  if (destino) {
+    d = (await colabsAll()).find((x) => x.id === destino);
+    if (!d || !isActivoColab(d)) throw bad('El colaborador destino no existe o no está activo');
+  }
+  const lista = await D.fetchAll('activos_maestros', [['select', 'id,regional_id,sede_id,ubicacion_especifica'], ['responsable_id', 'eq.' + origen], ['order', 'id.asc']]);
+  if (!lista.length) return { message: 'El colaborador no tiene activos asignados', reasignados: 0 };
+  await D.update('activos_maestros', { responsable_id: 'eq.' + origen }, { responsable_id: d ? d.id : null, updated_at: nowISO() });
+  dropCache('assetIndex');
+  const motivo = d ? `Reasignación por retiro de ${k.nombre_completo}` : `Devolución a stock por retiro de ${k.nombre_completo}`;
+  const hoy = todayCO();
+  for (let i = 0; i < lista.length; i += 300) {
+    const parte = lista.slice(i, i + 300);
+    await safe(c, 'movimientos', () => D.insert('movimientos', parte.map((a) => ({ activo_id: a.id, tipo_movimiento: d ? 'REASIGNACION' : 'DEVOLUCION', responsable_anterior_id: origen, responsable_nuevo_id: d ? d.id : null, regional_anterior_id: a.regional_id, regional_nueva_id: a.regional_id, sede_anterior_id: a.sede_id, sede_nueva_id: a.sede_id, ubicacion_nueva: d ? null : 'Stock disponible', motivo, usuario_id: c.user.id })), false));
+  }
+  await safe(c, 'asignaciones', async () => {
+    await D.update('asignaciones', { colaborador_id: 'eq.' + origen, fecha_devolucion: 'is.null' }, { fecha_devolucion: hoy, estado: 'DEVUELTA' });
+    if (d) for (let i = 0; i < lista.length; i += 300) await D.insert('asignaciones', lista.slice(i, i + 300).map((a) => ({ activo_id: a.id, colaborador_id: d.id, fecha_asignacion: hoy, estado: 'ACTIVA', motivo, usuario_id: c.user.id })), false);
   });
-  return { message: 'Activos reasignados', reasignados: lista.length };
+  return { message: 'Activos reasignados', reasignados: lista.length, advertencias: c.advertencias };
 });
 
-route('POST', '/api/colaboradores', (c) => {
-  const b = c.body, db = c.db;
-  const doc = String(b.documento || '').trim(), nombre = String(b.nombre_completo || '').trim();
+route('POST', '/api/colaboradores', async (c) => {
+  const b = c.body, L = await lookups();
+  const doc = str(b.documento, 40).trim(), nombre = str(b.nombre_completo, 200).trim();
   if (!doc || !nombre) throw bad('Documento y nombre son obligatorios');
-  if (db.colaboradores.some((k) => k.documento === doc)) throw new HttpError(409, 'Ya existe un colaborador con ese documento');
+  if ((await colabsAll()).some((k) => k.documento === doc)) throw new HttpError(409, 'Ya existe un colaborador con ese documento');
   const regional = toInt(b.regional_id), sede = toInt(b.sede_id);
-  if (regional) { if (!byId(db.regionales, regional)) throw bad('Regional inválida'); assertScope(c, regional); }
+  if (regional) { if (!L.R.get(regional)) throw bad('Regional inválida'); assertScope(c, regional); }
   else if (c.scope) throw bad('Debe seleccionar una regional');
-  const k = {
-    id: nextId(db.colaboradores), documento: doc, nombre_completo: nombre, cargo: b.cargo || '', regional_id: regional, sede_id: sede || null,
-    estado_vinculacion: 'ACTIVO', fecha_ingreso: b.fecha_ingreso || todayCO(), fecha_retiro: null
-  };
-  db.colaboradores.push(k);
-  return { ok: true, colaborador: colabView(db, k) };
+  if (sede && (!L.S.get(sede) || L.S.get(sede).regional_id !== regional)) throw bad('La sede no pertenece a la regional seleccionada');
+  const rows = await D.insert('colaboradores', { documento: doc, nombre_completo: nombre, cargo: str(b.cargo, 120), regional_id: regional, sede_id: sede || null, fecha_ingreso: b.fecha_ingreso || todayCO(), estado_vinculacion: 'ACTIVO' });
+  dropCache('colabs');
+  return { ok: true, colaborador: (await colabViews(rows))[0] };
 });
 
-route('POST', '/api/colaboradores/:id', (c) => {
-  const db = c.db, k = byId(db.colaboradores, toInt(c.params.id));
+route('POST', '/api/colaboradores/:id', async (c) => {
+  const id = toInt(c.params.id), b = c.body;
+  const k = (await colabsAll()).find((x) => x.id === id);
   if (!k) throw notFound('Colaborador no encontrado');
   assertScope(c, k.regional_id);
-  const b = c.body;
-  if (b.cargo != null) k.cargo = b.cargo;
+  const patch = {};
+  if (b.cargo != null) patch.cargo = str(b.cargo, 120);
+  let retiroNuevo = false;
   if (b.estado_vinculacion) {
     if (!['ACTIVO', 'RETIRADO'].includes(b.estado_vinculacion)) throw bad('Estado de vinculación inválido');
-    const antes = k.estado_vinculacion;
-    k.estado_vinculacion = b.estado_vinculacion;
-    k.fecha_retiro = b.estado_vinculacion === 'RETIRADO' ? b.fecha_retiro || todayCO() : null;
-    const n = totalActivosDe(db, k.id);
-    if (antes !== 'RETIRADO' && b.estado_vinculacion === 'RETIRADO' && n > 0) {
-      notify(db, { titulo: 'Colaborador retirado con activos pendientes', mensaje: `${k.nombre_completo} fue retirado y tiene ${n} activo(s) por devolver o reasignar.`, roles: ['ADMINISTRADOR', 'COORDINADOR'], regional_id: k.regional_id });
-    }
+    patch.estado_vinculacion = b.estado_vinculacion;
+    patch.fecha_retiro = b.estado_vinculacion === 'RETIRADO' ? b.fecha_retiro || todayCO() : null;
+    retiroNuevo = b.estado_vinculacion === 'RETIRADO' && !isRetirado(k);
   }
-  return { ok: true, colaborador: colabView(db, k) };
+  if (!Object.keys(patch).length) throw bad('No hay cambios para guardar');
+  await D.update('colaboradores', { id: 'eq.' + id }, patch);
+  dropCache('colabs');
+  if (retiroNuevo) {
+    const n = (await assetIndex()).filter((a) => a.responsable_id === id).length;
+    if (n > 0) await notify(c, { titulo: 'Colaborador retirado con activos pendientes', mensaje: `${k.nombre_completo} fue retirado y tiene ${n} activo(s) por devolver o reasignar.`, tipo: 'ALERTA', roles: ['ADMINISTRADOR', 'COORDINADOR'], regional_id: k.regional_id });
+  }
+  return { ok: true };
 });
 
 // ============================================================================
-// CALENDARIO / JORNADAS
+// CALENDARIO / JORNADAS (tabla programaciones)
 // ============================================================================
-route('GET', '/api/calendario', (c) => ({
-  jornadas: c.db.jornadas.filter((j) => inScope(c, j.regional_id)).sort((a, b) => (b.fecha_inicio > a.fecha_inicio ? 1 : -1)).map((j) => jornadaView(c.db, j))
-}));
+function jornadaEstado(j, verificados, meta) {
+  if (/finaliz/i.test(j.estado || '')) return 'FINALIZADO';
+  if (/cancel/i.test(j.estado || '')) return 'CANCELADO';
+  if (meta > 0 && verificados >= meta) return 'FINALIZADO';
+  const t = todayCO();
+  if (t > j.fecha_fin) return 'VENCIDO';
+  if (t >= j.fecha_inicio) return 'EN EJECUCION';
+  return 'PROGRAMADO';
+}
+async function jornadaViews(list) {
+  if (!list.length) return [];
+  const ids = list.map((j) => j.id);
+  const [L, idx, ps, inv, us] = await Promise.all([
+    lookups(), assetIndex(),
+    D.byIds('programacion_sedes', ids, 'programacion_id,sede_id', 'programacion_id'),
+    D.byIds('inventarios_fisicos', ids, 'programacion_id,activo_id', 'programacion_id'),
+    D.byIds('usuarios', list.map((j) => j.coordinador_id), 'id,nombre_completo')
+  ]);
+  const UM = new Map(us.map((u) => [u.id, u]));
+  return list.map((j) => {
+    const sedeIds = ps.filter((x) => x.programacion_id === j.id).map((x) => x.sede_id);
+    const verif = new Set(inv.filter((x) => x.programacion_id === j.id).map((x) => x.activo_id)).size;
+    const total = idx.filter((a) => a.regional_id === j.regional_id && (!sedeIds.length || sedeIds.includes(a.sede_id))).length;
+    const meta = j.meta_verificacion || j.cantidad_estimada || total;
+    return {
+      id: j.id, titulo: j.titulo, tipo_actividad: j.tipo_actividad, regional_id: j.regional_id, regional_nombre: (L.R.get(j.regional_id) || {}).nombre || '-',
+      sedes: sedeIds.map((id) => L.S.get(id)).filter(Boolean).map((s) => ({ id: s.id, nombre: s.nombre })),
+      fecha_inicio: j.fecha_inicio, fecha_fin: j.fecha_fin, hora_inicio: j.hora_inicio, hora_fin: j.hora_fin,
+      coordinador_nombre: (UM.get(j.coordinador_id) || {}).nombre_completo || null, activos_verificados: verif, meta_verificacion: j.meta_verificacion,
+      total_activos_sede: total, porcentaje_avance: meta ? Math.min(100, Math.round((verif / meta) * 100)) : 0, estado: jornadaEstado(j, verif, meta)
+    };
+  });
+}
 
-route('GET', '/api/calendario/control-nacional', (c) => ({
-  control_nacional: c.db.regionales.filter((r) => inScope(c, r.id)).map((r) => {
-    const js = c.db.jornadas.filter((j) => j.regional_id === r.id);
-    return { id: r.id, nombre: r.nombre, total_jornadas: js.length, en_ejecucion: js.filter((j) => jornadaEstado(j) === 'EN EJECUCION').length };
-  })
-}));
+route('GET', '/api/calendario', async (c) => {
+  const rows = await D.select('programaciones', [['select', '*'], ...scopePair(c), ['order', 'fecha_inicio.desc'], ['limit', 300]]);
+  return { jornadas: await jornadaViews(rows) };
+});
 
-route('POST', '/api/calendario', (c) => {
-  const b = c.body, db = c.db;
+route('GET', '/api/calendario/control-nacional', async (c) => {
+  const [L, rows] = await Promise.all([lookups(), D.select('programaciones', [['select', 'id,regional_id,fecha_inicio,fecha_fin,estado'], ...scopePair(c), ['limit', 1000]])]);
+  const hoy = todayCO();
+  return {
+    control_nacional: L.regionales.filter((r) => r.activa !== false && inScope(c, r.id)).map((r) => {
+      const js = rows.filter((j) => j.regional_id === r.id);
+      return { id: r.id, nombre: r.nombre, total_jornadas: js.length, en_ejecucion: js.filter((j) => !/finaliz|cancel/i.test(j.estado || '') && hoy >= j.fecha_inicio && hoy <= j.fecha_fin).length };
+    })
+  };
+});
+
+route('POST', '/api/calendario', async (c) => {
+  const b = c.body, L = await lookups();
   const regional = toInt(b.regional_id);
   if (!b.titulo) throw bad('El nombre de la actividad es obligatorio');
-  if (!byId(db.regionales, regional)) throw bad('Seleccione una regional válida');
+  if (!L.R.get(regional)) throw bad('Seleccione una regional válida');
   assertScope(c, regional);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(b.fecha_inicio || '') || !/^\d{4}-\d{2}-\d{2}$/.test(b.fecha_fin || '')) throw bad('Fechas inválidas');
   if (b.fecha_fin < b.fecha_inicio) throw bad('La fecha fin no puede ser anterior a la fecha de inicio');
-  const sedes = (Array.isArray(b.sedes_ids) ? b.sedes_ids : []).map(toInt).filter((id) => { const s = byId(db.sedes, id); return s && s.regional_id === regional; });
-  const coord = c.user.rol_id === 2 ? c.user : db.usuarios.find((u) => u.rol_id === 2 && u.regionales.includes(regional)) || c.user;
-  const j = {
-    id: nextId(db.jornadas), titulo: b.titulo, tipo_actividad: b.tipo_actividad || 'Verificación física', regional_id: regional, sedes_ids: sedes,
-    fecha_inicio: b.fecha_inicio, fecha_fin: b.fecha_fin, hora_inicio: '08:00', hora_fin: '17:00', coordinador_id: coord.id,
-    meta_verificacion: Math.max(0, toInt(b.meta_verificacion) || 0), verificados: [], historial: [], finalizada: false
-  };
-  db.jornadas.push(j);
-  if (b.crear_chat) db.conversaciones.push({ id: nextId(db.conversaciones), titulo: `Jornada: ${j.titulo}`, regional_id: regional });
-  notify(db, { titulo: 'Nueva jornada programada', mensaje: `${j.titulo} (${j.fecha_inicio} al ${j.fecha_fin}).`, regional_id: regional });
-  return { ok: true, jornada: jornadaView(db, j) };
+  const sedes = (Array.isArray(b.sedes_ids) ? b.sedes_ids : []).map(toInt).filter((id) => L.S.get(id) && L.S.get(id).regional_id === regional);
+  const rows = await D.insert('programaciones', {
+    titulo: str(b.titulo, 200), tipo_actividad: str(b.tipo_actividad, 80) || 'Verificación física', regional_id: regional, fecha_inicio: b.fecha_inicio, fecha_fin: b.fecha_fin,
+    hora_inicio: '08:00', hora_fin: '17:00', coordinador_id: c.user.id, meta_verificacion: Math.max(0, toInt(b.meta_verificacion) || 0),
+    prioridad: 'MEDIA', estado: 'PROGRAMADO', created_by: c.user.id
+  });
+  const j = rows[0];
+  if (sedes.length) await safe(c, 'sedes de la jornada', () => D.insert('programacion_sedes', sedes.map((s) => ({ programacion_id: j.id, sede_id: s })), false));
+  if (b.crear_chat) await safe(c, 'chat de la jornada', () => D.insert('conversaciones', { titulo: `Jornada: ${j.titulo}`, tipo: 'JORNADA', regional_id: regional, programacion_id: j.id }, false));
+  await notify(c, { titulo: 'Nueva jornada programada', mensaje: `${j.titulo} (${j.fecha_inicio} al ${j.fecha_fin}).`, regional_id: regional });
+  return { ok: true, jornada: (await jornadaViews([j]))[0], advertencias: c.advertencias };
 }, { roles: ['ADMINISTRADOR', 'COORDINADOR'] });
 
-route('POST', '/api/calendario/:id/reprogramar', (c) => {
-  const db = c.db, j = byId(db.jornadas, toInt(c.params.id)), b = c.body;
+route('POST', '/api/calendario/:id/reprogramar', async (c) => {
+  const id = toInt(c.params.id), b = c.body;
+  const j = (await D.select('programaciones', { select: '*', id: 'eq.' + id, limit: 1 }))[0];
   if (!j) throw notFound('Jornada no encontrada');
   assertScope(c, j.regional_id);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(b.fecha_inicio || '') || !/^\d{4}-\d{2}-\d{2}$/.test(b.fecha_fin || '')) throw bad('Fechas inválidas');
   if (b.fecha_fin < b.fecha_inicio) throw bad('La fecha fin no puede ser anterior a la fecha de inicio');
   if (!b.motivo) throw bad('El motivo de la reprogramación es obligatorio');
-  j.historial.push({ fecha: nowCO(), anterior: `${j.fecha_inicio} al ${j.fecha_fin}`, nuevo: `${b.fecha_inicio} al ${b.fecha_fin}`, motivo: b.motivo, usuario_id: c.user.id });
-  j.fecha_inicio = b.fecha_inicio; j.fecha_fin = b.fecha_fin; j.finalizada = false;
-  notify(db, { titulo: 'Jornada reprogramada', mensaje: `${j.titulo}: ${b.fecha_inicio} al ${b.fecha_fin}. Motivo: ${b.motivo}`, regional_id: j.regional_id });
-  return { ok: true, jornada: jornadaView(db, j) };
+  const obs = `${j.observaciones ? j.observaciones + '\n' : ''}[${todayCO()}] Reprogramada: ${j.fecha_inicio} al ${j.fecha_fin} → ${b.fecha_inicio} al ${b.fecha_fin}. Motivo: ${str(b.motivo, 300)}`;
+  await D.update('programaciones', { id: 'eq.' + id }, { fecha_inicio: b.fecha_inicio, fecha_fin: b.fecha_fin, estado: 'PROGRAMADO', observaciones: obs, updated_at: nowISO() });
+  await hist(c, 'programaciones', id, 'REPROGRAMAR', { fecha_inicio: j.fecha_inicio, fecha_fin: j.fecha_fin }, { fecha_inicio: b.fecha_inicio, fecha_fin: b.fecha_fin, motivo: b.motivo });
+  await notify(c, { titulo: 'Jornada reprogramada', mensaje: `${j.titulo}: ${b.fecha_inicio} al ${b.fecha_fin}. Motivo: ${b.motivo}`, regional_id: j.regional_id });
+  return { ok: true };
 }, { roles: ['ADMINISTRADOR', 'COORDINADOR'] });
 
 // ============================================================================
 // CHAT
 // ============================================================================
-const convVisible = (c, v) => v.regional_id == null || c.scope == null || c.scope.includes(v.regional_id);
+async function convVisibles(c) {
+  const convs = await D.select('conversaciones', [['select', 'id,titulo,tipo,regional_id,sede_id,programacion_id'], ['order', 'id.asc'], ['limit', 500]]);
+  if (c.scope == null) return convs;
+  const part = await D.select('participantes_conversacion', { select: 'conversacion_id', usuario_id: 'eq.' + c.user.id });
+  const mine = new Set(part.map((p) => p.conversacion_id));
+  return convs.filter((v) => v.regional_id == null || c.scope.includes(v.regional_id) || mine.has(v.id));
+}
 
-route('GET', '/api/chat/conversaciones', (c) => ({
-  conversaciones: c.db.conversaciones.filter((v) => convVisible(c, v)).map((v) => {
-    const ms = c.db.mensajes.filter((m) => m.conversacion_id === v.id);
-    const last = ms[ms.length - 1];
-    return { id: v.id, titulo: v.titulo, regional_id: v.regional_id, ultimo_mensaje: last ? last.texto : null };
-  })
-}));
+route('GET', '/api/chat/conversaciones', async (c) => {
+  const convs = await convVisibles(c);
+  const msgs = convs.length ? await D.select('mensajes', [['select', 'conversacion_id,texto,created_at'], ['conversacion_id', `in.(${convs.map((v) => v.id).join(',')})`], ['order', 'created_at.desc'], ['limit', 400]]) : [];
+  return { conversaciones: convs.map((v) => { const m = msgs.find((x) => x.conversacion_id === v.id); return { id: v.id, titulo: v.titulo, tipo: v.tipo, regional_id: v.regional_id, ultimo_mensaje: m ? m.texto : null }; }) };
+});
 
-route('GET', '/api/chat/mensajes/:id', (c) => {
-  const db = c.db, conv = byId(db.conversaciones, toInt(c.params.id));
-  if (!conv || !convVisible(c, conv)) throw notFound('Conversación no encontrada');
+route('GET', '/api/chat/mensajes/:id', async (c) => {
+  const id = toInt(c.params.id);
+  if (!(await convVisibles(c)).some((v) => v.id === id)) throw notFound('Conversación no encontrada');
+  const rows = (await D.select('mensajes', { select: '*', conversacion_id: 'eq.' + id, order: 'created_at.desc', limit: 200 })).reverse();
+  const [us, as] = await Promise.all([
+    D.byIds('usuarios', rows.map((m) => m.remitente_id), 'id,nombre_completo,cargo'),
+    D.byIds('activos_maestros', rows.map((m) => m.activo_compartido_id), 'id,nombre,codigo_inventario,numero_serie')
+  ]);
+  const UM = new Map(us.map((u) => [u.id, u])), AM = new Map(as.map((a) => [a.id, a]));
   return {
-    mensajes: db.mensajes.filter((m) => m.conversacion_id === conv.id).slice(-200).map((m) => {
-      const u = byId(db.usuarios, m.remitente_id), a = m.activo_id ? findActivo(db, m.activo_id) : null;
+    mensajes: rows.map((m) => {
+      const u = UM.get(m.remitente_id) || {}, a = AM.get(m.activo_compartido_id);
       return {
-        id: m.id, remitente_id: m.remitente_id, remitente_nombre: u ? u.nombre_completo : 'Usuario', remitente_cargo: u ? u.cargo : '',
-        texto: m.texto, created_at: m.created_at, activo_compartido_id: a ? a.id : null, activo_nombre: a ? a.nombre : null,
-        activo_codigo: a ? a.codigo_inventario : null, activo_serie: a ? a.numero_serie : null
+        id: m.id, remitente_id: m.remitente_id, remitente_nombre: u.nombre_completo || 'Usuario', remitente_cargo: u.cargo || '', texto: m.texto, created_at: co(m.created_at),
+        activo_compartido_id: a ? a.id : null, activo_nombre: a ? a.nombre : null, activo_codigo: a ? a.codigo_inventario : null, activo_serie: a ? a.numero_serie : null
       };
     })
   };
 });
 
-route('POST', '/api/chat/mensajes', (c) => {
-  const db = c.db, b = c.body, conv = byId(db.conversaciones, toInt(b.conversacion_id));
-  if (!conv || !convVisible(c, conv)) throw notFound('Conversación no encontrada');
-  const texto = String(b.texto || '').slice(0, 2000);
-  const a = b.activo_id ? findActivo(db, b.activo_id) : null;
+route('POST', '/api/chat/mensajes', async (c) => {
+  const b = c.body, id = toInt(b.conversacion_id);
+  if (!(await convVisibles(c)).some((v) => v.id === id)) throw notFound('Conversación no encontrada');
+  const texto = str(b.texto, 2000);
+  const a = b.activo_id && UUID.test(String(b.activo_id)) ? await getActivo(b.activo_id) : null;
   if (!texto && !a) throw bad('El mensaje está vacío');
-  const m = { id: nextId(db.mensajes), conversacion_id: conv.id, remitente_id: c.user.id, texto, activo_id: a ? a.id : null, created_at: nowCO() };
-  db.mensajes.push(m);
-  if (db.mensajes.length > 2000) db.mensajes.splice(0, db.mensajes.length - 2000);
-  return { ok: true, mensaje_id: m.id };
+  const r = await D.insert('mensajes', { conversacion_id: id, remitente_id: c.user.id, texto, activo_compartido_id: a ? a.id : null });
+  return { ok: true, mensaje_id: r[0] && r[0].id };
 });
 
 // ============================================================================
 // CALIDAD Y AUDITORÍAS
 // ============================================================================
-route('GET', '/api/calidad/lista-chequeo', (c) => ({ items: c.db.checklist }));
+async function checklistItems() {
+  return cached('checklist', 60000, async () => {
+    let lista = (await D.select('listas_chequeo', { select: 'id', activa: 'eq.true', order: 'id.desc', limit: 1 }))[0];
+    if (!lista) lista = (await D.select('listas_chequeo', { select: 'id', order: 'id.desc', limit: 1 }))[0];
+    if (!lista) return [];
+    return D.select('lista_chequeo_items', { select: 'id,orden,pregunta', lista_id: 'eq.' + lista.id, order: 'orden.asc' });
+  });
+}
+route('GET', '/api/calidad/lista-chequeo', async () => ({ items: await checklistItems() }));
 
-route('GET', '/api/calidad/auditorias', (c) => ({
-  auditorias: c.db.auditorias.filter((a) => inScope(c, a.regional_id)).sort((a, b) => b.id - a.id).map((a) => auditoriaView(c.db, a))
-}));
+async function auditoriaViews(list) {
+  if (!list.length) return [];
+  const [L, us, hz] = await Promise.all([
+    lookups(), D.byIds('usuarios', list.map((a) => a.auditor_id), 'id,nombre_completo'),
+    D.byIds('hallazgos', list.map((a) => a.id), 'id,auditoria_id', 'auditoria_id')
+  ]);
+  const UM = new Map(us.map((u) => [u.id, u]));
+  return list.map((a) => ({
+    id: a.id, codigo: a.codigo, titulo: a.titulo, regional_id: a.regional_id, regional_nombre: (L.R.get(a.regional_id) || {}).nombre || '-',
+    sede_id: a.sede_id, sede_nombre: (L.S.get(a.sede_id) || {}).nombre || null, tipo_alcance: a.tipo_alcance, fecha_programada: a.fecha_programada,
+    auditor_nombre: (UM.get(a.auditor_id) || {}).nombre_completo || '-', porcentaje_cumplimiento: a.porcentaje_cumplimiento == null ? 0 : Number(a.porcentaje_cumplimiento),
+    total_hallazgos: hz.filter((h) => h.auditoria_id === a.id).length, estado: a.estado, resultado_final: a.resultado_final
+  }));
+}
 
-route('GET', '/api/calidad/auditorias/:id', (c) => {
-  const db = c.db, au = byId(db.auditorias, toInt(c.params.id));
+route('GET', '/api/calidad/auditorias', async (c) => {
+  const rows = await D.select('auditorias', [['select', '*'], ...scopePair(c), ['order', 'id.desc'], ['limit', 300]]);
+  return { auditorias: await auditoriaViews(rows) };
+});
+
+route('GET', '/api/calidad/auditorias/:id', async (c) => {
+  const au = (await D.select('auditorias', { select: '*', id: 'eq.' + toInt(c.params.id), limit: 1 }))[0];
   if (!au) throw notFound('Auditoría no encontrada');
   assertScope(c, au.regional_id);
-  const v = auditoriaView(db, au);
-  v.detalles = au.detalle_ids.map((id) => findActivo(db, id)).filter(Boolean).map((a) => ({
-    activo_id: a.id, activo_nombre: a.nombre, codigo_inventario: a.codigo_inventario, numero_serie: a.numero_serie,
-    evaluado: !!au.evaluaciones[a.id], porcentaje: au.evaluaciones[a.id] ? au.evaluaciones[a.id].porcentaje : null
-  }));
+  const [v] = await auditoriaViews([au]);
+  const det = await D.fetchAll('auditoria_detalle', [['select', 'id,activo_id,resultado_activo,porcentaje_activo'], ['auditoria_id', 'eq.' + au.id], ['order', 'id.asc']]);
+  const as = await D.byIds('activos_maestros', det.map((d) => d.activo_id), 'id,nombre,codigo_inventario,numero_serie');
+  const AM = new Map(as.map((a) => [a.id, a]));
+  v.detalles = det.map((d) => {
+    const a = AM.get(d.activo_id) || {};
+    return { activo_id: d.activo_id, activo_nombre: a.nombre || 'Activo', codigo_inventario: a.codigo_inventario || null, numero_serie: a.numero_serie || null, evaluado: d.resultado_activo != null, porcentaje: d.porcentaje_activo };
+  });
   return { auditoria: v };
 });
 
-route('POST', '/api/calidad/auditorias', (c) => {
-  const db = c.db, b = c.body, regional = toInt(b.regional_id), sede = toInt(b.sede_id);
+route('POST', '/api/calidad/auditorias', async (c) => {
+  const b = c.body, L = await lookups(), regional = toInt(b.regional_id), sede = toInt(b.sede_id);
   if (!b.titulo) throw bad('El título es obligatorio');
-  const s = byId(db.sedes, sede);
-  if (!byId(db.regionales, regional) || !s || s.regional_id !== regional) throw bad('Seleccione una regional y una sede válidas');
+  if (!L.R.get(regional) || !L.S.get(sede) || L.S.get(sede).regional_id !== regional) throw bad('Seleccione una regional y una sede válidas');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(b.fecha_programada || '')) throw bad('Fecha programada inválida');
-  let ids = db.activos.filter((a) => a.sede_id === sede).map((a) => a.id);
+  let ids = (await D.fetchAll('activos_maestros', [['select', 'id'], ['sede_id', 'eq.' + sede], ['order', 'id.asc']])).map((a) => a.id);
   const alcance = b.tipo_alcance === 'MUESTRA_ALEATORIA' ? 'MUESTRA_ALEATORIA' : 'SEDE_COMPLETA';
   if (alcance === 'MUESTRA_ALEATORIA') {
     for (let i = ids.length - 1; i > 0; i--) { const j = crypto.randomInt(i + 1); [ids[i], ids[j]] = [ids[j], ids[i]]; }
     ids = ids.slice(0, Math.min(ids.length, Math.max(5, Math.ceil(ids.length * 0.2))));
   }
-  const au = {
-    id: nextId(db.auditorias), codigo: `AUD-${b.fecha_programada.slice(0, 4)}-${pad(nextId(db.auditorias), 4)}`, titulo: b.titulo, regional_id: regional, sede_id: sede,
-    tipo_alcance: alcance, fecha_programada: b.fecha_programada, auditor_id: c.user.id, estado: 'PROGRAMADA', resultado_final: null, detalle_ids: ids, evaluaciones: {}
-  };
-  db.auditorias.push(au);
-  notify(db, { titulo: 'Auditoría programada', mensaje: `${au.codigo}: ${au.titulo} (${au.fecha_programada}).`, regional_id: regional });
-  return { ok: true, auditoria_id: au.id, message: ids.length ? `Auditoría ${au.codigo} programada con ${ids.length} activo(s) en alcance` : `Auditoría ${au.codigo} programada, pero la sede aún no tiene activos en alcance` };
+  const last = (await D.select('auditorias', { select: 'id', order: 'id.desc', limit: 1 }))[0];
+  const codigo = `AUD-${b.fecha_programada.slice(0, 4)}-${pad((last ? last.id : 0) + 1, 4)}`;
+  const au = (await D.insert('auditorias', { codigo, titulo: str(b.titulo, 200), regional_id: regional, sede_id: sede, auditor_id: c.user.id, fecha_programada: b.fecha_programada, tipo_alcance: alcance, estado: 'PROGRAMADA' }))[0];
+  for (let i = 0; i < ids.length; i += 300) await D.insert('auditoria_detalle', ids.slice(i, i + 300).map((activo_id) => ({ auditoria_id: au.id, activo_id })), false);
+  await notify(c, { titulo: 'Auditoría programada', mensaje: `${codigo}: ${au.titulo} (${au.fecha_programada}).`, regional_id: regional });
+  return { ok: true, auditoria_id: au.id, message: ids.length ? `Auditoría ${codigo} programada con ${ids.length} activo(s) en alcance` : `Auditoría ${codigo} programada, pero la sede aún no tiene activos en alcance`, advertencias: c.advertencias };
 }, { roles: ['ADMINISTRADOR', 'CALIDAD / AUDITOR'] });
 
-route('POST', '/api/calidad/evaluar-activo', (c) => {
-  const db = c.db, b = c.body, au = byId(db.auditorias, toInt(b.auditoria_id));
+route('POST', '/api/calidad/evaluar-activo', async (c) => {
+  const b = c.body, auId = toInt(b.auditoria_id);
+  const au = (await D.select('auditorias', { select: '*', id: 'eq.' + auId, limit: 1 }))[0];
   if (!au) throw notFound('Auditoría no encontrada');
-  if (!au.detalle_ids.includes(String(b.activo_id))) throw bad('El activo no pertenece al alcance de la auditoría');
+  if (!UUID.test(String(b.activo_id))) throw bad('Activo inválido');
+  const det = (await D.select('auditoria_detalle', { select: 'id', auditoria_id: 'eq.' + auId, activo_id: 'eq.' + b.activo_id, limit: 1 }))[0];
+  if (!det) throw bad('El activo no pertenece al alcance de la auditoría');
   const resp = Array.isArray(b.respuestas) ? b.respuestas : [];
   if (!resp.length) throw bad('Debe responder la lista de chequeo');
-  let si = 0, no = 0, na = 0;
-  const a = findActivo(db, b.activo_id);
-  db.hallazgos = db.hallazgos.filter((h) => !(h.auditoria_id === au.id && h.activo_id === a.id && h.estado === 'ABIERTO'));
-  resp.forEach((r) => {
-    if (r.respuesta === 'SI') si++;
-    else if (r.respuesta === 'NO') {
-      no++;
-      const item = db.checklist.find((x) => x.id === toInt(r.item_id));
-      const n = nextId(db.hallazgos);
-      db.hallazgos.push({
-        id: n, codigo: `HAL-${todayCO().slice(0, 4)}-${pad(n, 4)}`, auditoria_id: au.id, activo_id: a.id, regional_id: au.regional_id, sede_id: au.sede_id,
-        descripcion: r.observacion || (item ? `Incumple: ${item.pregunta}` : 'Incumplimiento detectado'),
-        criticidad: ['BAJA', 'MEDIA', 'ALTA', 'CRITICA'].includes(r.criticidad) ? r.criticidad : 'MEDIA', fecha_compromiso: addDays(todayCO(), 15),
-        estado: 'ABIERTO', accion_realizada: '', evidencia_correccion: '', historial: []
-      });
-    } else na++;
-  });
+  const items = await checklistItems();
+  let si = 0, no = 0;
+  const filas = resp.map((r) => {
+    const v = ['SI', 'NO', 'NO_APLICA'].includes(r.respuesta) ? r.respuesta : 'NO_APLICA';
+    if (v === 'SI') si++; else if (v === 'NO') no++;
+    return { auditoria_detalle_id: det.id, item_id: toInt(r.item_id), respuesta: v, observacion: str(r.observacion, 500) || null, _crit: r.criticidad };
+  }).filter((r) => r.item_id);
   const pct = si + no ? Math.round((si / (si + no)) * 1000) / 10 : 100;
-  au.evaluaciones[a.id] = { si, no, na, porcentaje: pct, observaciones: b.observaciones || '', fecha: nowCO(), auditor_id: c.user.id };
-  a.verificado_en = nowCO();
-  const total = auditoriaPct(au);
-  if (Object.keys(au.evaluaciones).length >= au.detalle_ids.length) {
-    au.resultado_final = total >= 90 ? 'CONFORME' : 'NO_CONFORME';
-    au.estado = au.resultado_final;
-  } else { au.estado = 'EN EJECUCION'; au.resultado_final = null; }
-  return { ok: true, porcentaje: pct, message: `Evaluación registrada. Cumplimiento del activo: ${pct}%${au.resultado_final ? ` · Auditoría finalizada: ${au.resultado_final}` : ''}` };
+  await D.remove('auditoria_respuestas', { auditoria_detalle_id: 'eq.' + det.id });
+  await D.insert('auditoria_respuestas', filas.map(({ _crit, ...f }) => f), false);
+  await D.update('auditoria_detalle', { id: 'eq.' + det.id }, { resultado_activo: pct >= 90 ? 'CONFORME' : 'NO_CONFORME', porcentaje_activo: pct, observaciones: str(b.observaciones, 1000) || null });
+  // Hallazgos por cada "NO" (se reemplazan los abiertos previos de este activo en esta auditoría)
+  await safe(c, 'hallazgos', async () => {
+    await D.remove('hallazgos', { auditoria_id: 'eq.' + auId, activo_id: 'eq.' + b.activo_id, estado: 'eq.ABIERTO' });
+    const nuevos = filas.filter((f) => f.respuesta === 'NO');
+    if (!nuevos.length) return;
+    const last = (await D.select('hallazgos', { select: 'id', order: 'id.desc', limit: 1 }))[0];
+    let n = (last ? last.id : 0) + 1;
+    const anio = todayCO().slice(0, 4);
+    await D.insert('hallazgos', nuevos.map((f, i) => {
+      const it = items.find((x) => x.id === f.item_id);
+      return {
+        codigo: `HAL-${anio}-${pad(n + i, 4)}`, auditoria_id: auId, activo_id: b.activo_id, regional_id: au.regional_id, sede_id: au.sede_id,
+        descripcion: f.observacion || (it ? `Incumple: ${it.pregunta}` : 'Incumplimiento detectado'),
+        criticidad: ['BAJA', 'MEDIA', 'ALTA', 'CRITICA'].includes(resp.find((r) => toInt(r.item_id) === f.item_id).criticidad) ? resp.find((r) => toInt(r.item_id) === f.item_id).criticidad : 'MEDIA',
+        fecha_compromiso: addDays(todayCO(), 15), estado: 'ABIERTO'
+      };
+    }), false);
+  });
+  const todos = await D.select('auditoria_detalle', { select: 'resultado_activo,porcentaje_activo', auditoria_id: 'eq.' + auId, limit: 5000 });
+  const evaluados = todos.filter((d) => d.resultado_activo != null);
+  const prom = evaluados.length ? Math.round((evaluados.reduce((s, d) => s + Number(d.porcentaje_activo || 0), 0) / evaluados.length) * 10) / 10 : null;
+  const completa = evaluados.length >= todos.length;
+  const final = completa ? (prom >= 90 ? 'CONFORME' : 'NO_CONFORME') : null;
+  await D.update('auditorias', { id: 'eq.' + auId }, { porcentaje_cumplimiento: prom, estado: final || 'EN EJECUCION', resultado_final: final, fecha_ejecucion: todayCO(), updated_at: nowISO() });
+  await registrarInventarioFisico(c, (await getActivo(b.activo_id)) || { id: b.activo_id }, { observaciones: 'Verificación en auditoría ' + au.codigo });
+  return { ok: true, porcentaje: pct, message: `Evaluación registrada. Cumplimiento del activo: ${pct}%${final ? ` · Auditoría finalizada: ${final}` : ''}`, advertencias: c.advertencias };
 }, { roles: ['ADMINISTRADOR', 'CALIDAD / AUDITOR'] });
 
 // ============================================================================
 // HALLAZGOS, NOVEDADES, MANTENIMIENTOS, MOVIMIENTOS
 // ============================================================================
-route('GET', '/api/hallazgos', (c) => ({
-  hallazgos: c.db.hallazgos.filter((h) => inScope(c, h.regional_id)).sort((a, b) => b.id - a.id).map((h) => hallazgoView(c.db, h))
-}));
-
-route('POST', '/api/hallazgos/:id/actualizar', (c) => {
-  const db = c.db, h = byId(db.hallazgos, toInt(c.params.id)), b = c.body;
-  if (!h) throw notFound('Hallazgo no encontrado');
-  assertScope(c, h.regional_id);
-  if (!ESTADOS_HALLAZGO.includes(b.estado)) throw bad('Estado inválido');
-  const evid = String(b.evidencia_correccion || '').trim();
-  if (b.estado === 'CERRADO' && !evid && !h.evidencia_correccion) throw bad('No se puede cerrar un hallazgo sin evidencia fotográfica o documental.');
-  h.historial.push({ fecha: nowCO(), de: h.estado, a: b.estado, usuario_id: c.user.id });
-  h.estado = b.estado;
-  if (b.accion_realizada) h.accion_realizada = b.accion_realizada;
-  if (evid) h.evidencia_correccion = evid;
-  return { ok: true, hallazgo: hallazgoView(db, h) };
+async function hallazgoViews(list) {
+  const [L, as, aus] = await Promise.all([
+    lookups(), D.byIds('activos_maestros', list.map((h) => h.activo_id), 'id,nombre,codigo_inventario'), D.byIds('auditorias', list.map((h) => h.auditoria_id), 'id,codigo')
+  ]);
+  const AM = new Map(as.map((a) => [a.id, a])), UM = new Map(aus.map((a) => [a.id, a]));
+  return list.map((h) => ({
+    id: h.id, codigo: h.codigo, auditoria_codigo: (UM.get(h.auditoria_id) || {}).codigo || null, descripcion: h.descripcion,
+    activo_nombre: (AM.get(h.activo_id) || {}).nombre || '', codigo_inventario: (AM.get(h.activo_id) || {}).codigo_inventario || '',
+    regional_nombre: (L.R.get(h.regional_id) || {}).nombre || '-', sede_nombre: (L.S.get(h.sede_id) || {}).nombre || '',
+    criticidad: h.criticidad, fecha_compromiso: h.fecha_compromiso, estado: h.estado, accion_realizada: h.accion_correctiva || '', evidencia_correccion: h.evidencia_correccion || ''
+  }));
+}
+route('GET', '/api/hallazgos', async (c) => {
+  const rows = await D.select('hallazgos', [['select', '*'], ...scopePair(c), ['order', 'id.desc'], ['limit', 500]]);
+  return { hallazgos: await hallazgoViews(rows) };
 });
 
-const actReg = (db, id) => { const a = findActivo(db, id); return a ? a.regional_id : null; };
+route('POST', '/api/hallazgos/:id/actualizar', async (c) => {
+  const id = toInt(c.params.id), b = c.body;
+  const h = (await D.select('hallazgos', { select: '*', id: 'eq.' + id, limit: 1 }))[0];
+  if (!h) throw notFound('Hallazgo no encontrado');
+  assertScope(c, h.regional_id);
+  if (!['ABIERTO', 'EN PROCESO', 'PENDIENTE DE EVIDENCIA', 'EN VALIDACIÓN', 'CERRADO'].includes(b.estado)) throw bad('Estado inválido');
+  const evid = str(b.evidencia_correccion, 4000).trim();
+  if (b.estado === 'CERRADO' && !evid && !h.evidencia_correccion) throw bad('No se puede cerrar un hallazgo sin evidencia fotográfica o documental.');
+  const patch = { estado: b.estado, updated_at: nowISO() };
+  const accion = str(b.accion_realizada, 2000).trim();
+  if (accion) patch.accion_correctiva = accion;
+  if (evid) patch.evidencia_correccion = evid;
+  if (b.estado === 'CERRADO') patch.fecha_ejecucion = todayCO();
+  await D.update('hallazgos', { id: 'eq.' + id }, patch);
+  if (accion || evid) await safe(c, 'acción correctiva', () => D.insert('acciones_correctivas', { hallazgo_id: id, descripcion: accion || 'Evidencia registrada', usuario_id: c.user.id, evidencia_url: evid || null }, false));
+  return { ok: true, advertencias: c.advertencias };
+});
 
-route('GET', '/api/novedades', (c) => ({
-  novedades: c.db.novedades.filter((n) => inScope(c, n.regional_id != null ? n.regional_id : actReg(c.db, n.activo_id))).sort((a, b) => (b.fecha > a.fecha ? 1 : -1)).slice(0, 300).map((n) => {
-    const a = findActivo(c.db, n.activo_id);
-    return { ...n, activo_nombre: a ? a.nombre : 'Activo', codigo_inventario: a ? a.codigo_inventario : '' };
-  })
-}));
+async function regionalOfActivos(ids) {
+  const as = await D.byIds('activos_maestros', ids, 'id,nombre,codigo_inventario,regional_id');
+  return new Map(as.map((a) => [a.id, a]));
+}
 
-route('GET', '/api/mantenimientos', (c) => ({
-  mantenimientos: c.db.mantenimientos.filter((m) => inScope(c, actReg(c.db, m.activo_id))).map((m) => {
-    const a = findActivo(c.db, m.activo_id);
-    return { ...m, activo_nombre: a ? a.nombre : 'Activo' };
-  })
-}));
+route('GET', '/api/novedades', async (c) => {
+  const rows = await D.select('novedades', [['select', '*'], ['order', 'fecha.desc'], ['limit', c.scope ? 1000 : 300]]);
+  const AM = await regionalOfActivos(rows.map((n) => n.activo_id));
+  return {
+    novedades: rows.filter((n) => inScope(c, (AM.get(n.activo_id) || {}).regional_id)).slice(0, 300).map((n) => ({
+      id: n.id, fecha: co(n.fecha), activo_nombre: (AM.get(n.activo_id) || {}).nombre || 'Activo', codigo_inventario: (AM.get(n.activo_id) || {}).codigo_inventario || '',
+      tipo_novedad: n.tipo_novedad, campo_modificado: n.campo_modificado, valor_anterior: n.valor_anterior, valor_nuevo: n.valor_nuevo, justificacion: n.justificacion, estado: n.estado
+    }))
+  };
+});
 
-route('GET', '/api/movimientos', (c) => ({
-  movimientos: c.db.movimientos.filter((m) => inScope(c, actReg(c.db, m.activo_id))).sort((a, b) => (b.fecha > a.fecha ? 1 : -1)).slice(0, 300).map((m) => movView(c.db, m))
-}));
+route('GET', '/api/mantenimientos', async (c) => {
+  const rows = await D.select('mantenimientos', [['select', '*'], ['order', 'fecha_solicitud.desc'], ['limit', c.scope ? 1000 : 300]]);
+  const AM = await regionalOfActivos(rows.map((m) => m.activo_id));
+  return { mantenimientos: rows.filter((m) => inScope(c, (AM.get(m.activo_id) || {}).regional_id)).slice(0, 300).map((m) => ({ ...m, activo_nombre: (AM.get(m.activo_id) || {}).nombre || 'Activo' })) };
+});
+
+async function movViews(rows) {
+  const L = await lookups();
+  const [as, ks, us] = await Promise.all([
+    D.byIds('activos_maestros', rows.map((m) => m.activo_id), 'id,nombre,codigo_inventario'),
+    D.byIds('colaboradores', rows.flatMap((m) => [m.responsable_anterior_id, m.responsable_nuevo_id]), 'id,nombre_completo'),
+    D.byIds('usuarios', rows.map((m) => m.usuario_id), 'id,nombre_completo')
+  ]);
+  const AM = new Map(as.map((x) => [x.id, x])), KM = new Map(ks.map((x) => [x.id, x])), UM = new Map(us.map((x) => [x.id, x]));
+  const lugar = (rid, sid) => [(L.R.get(rid) || {}).nombre, (L.S.get(sid) || {}).nombre].filter(Boolean).join(' / ') || null;
+  return rows.map((m) => ({
+    id: m.id, fecha: co(m.fecha), activo_id: m.activo_id, activo_nombre: (AM.get(m.activo_id) || {}).nombre || 'Activo', codigo_inventario: (AM.get(m.activo_id) || {}).codigo_inventario || '',
+    tipo_movimiento: m.tipo_movimiento, motivo: m.motivo || m.observaciones || '',
+    resp_ant_nombre: (KM.get(m.responsable_anterior_id) || {}).nombre_completo || null, resp_nvo_nombre: (KM.get(m.responsable_nuevo_id) || {}).nombre_completo || null,
+    ubicacion_anterior: m.ubicacion_anterior || lugar(m.regional_anterior_id, m.sede_anterior_id), ubicacion_nueva: m.ubicacion_nueva || lugar(m.regional_nueva_id, m.sede_nueva_id),
+    usuario_nombre: (UM.get(m.usuario_id) || {}).nombre_completo || 'Sistema'
+  }));
+}
+route('GET', '/api/movimientos', async (c) => {
+  const rows = await D.select('movimientos', [['select', '*'], ['order', 'fecha.desc'], ['limit', c.scope ? 1000 : 300]]);
+  const AM = await regionalOfActivos(rows.map((m) => m.activo_id));
+  return { movimientos: await movViews(rows.filter((m) => inScope(c, (AM.get(m.activo_id) || {}).regional_id)).slice(0, 300)) };
+});
 
 // ============================================================================
 // NOTIFICACIONES Y USUARIOS
 // ============================================================================
-const notifVisible = (c, n) =>
-  (n.usuario_id == null || n.usuario_id === c.user.id) && (!n.roles || n.roles.includes(c.role)) && (n.regional_id == null || inScope(c, n.regional_id));
-
-route('GET', '/api/notificaciones', (c) => ({
-  notificaciones: c.db.notificaciones.filter((n) => notifVisible(c, n)).sort((a, b) => b.id - a.id).slice(0, 50).map((n) => ({
-    id: n.id, titulo: n.titulo, mensaje: n.mensaje, created_at: n.created_at, link: n.link, leida: n.leida_por.includes(c.user.id)
-  }))
+route('GET', '/api/notificaciones', async (c) => ({
+  notificaciones: (await D.select('notificaciones', { select: 'id,titulo,mensaje,tipo,link,leida,created_at', usuario_id: 'eq.' + c.user.id, order: 'created_at.desc', limit: 50 }))
+    .map((n) => ({ ...n, created_at: co(n.created_at), leida: !!n.leida }))
 }));
-
-route('POST', '/api/notificaciones/leer', (c) => {
-  c.db.notificaciones.forEach((n) => { if (notifVisible(c, n) && !n.leida_por.includes(c.user.id)) n.leida_por.push(c.user.id); });
+route('POST', '/api/notificaciones/leer', async (c) => {
+  await D.update('notificaciones', { usuario_id: 'eq.' + c.user.id, leida: 'eq.false' }, { leida: true });
   return { ok: true };
 });
 
-route('GET', '/api/usuarios', (c) => ({
-  usuarios: c.db.usuarios.map((u) => ({ id: u.id, nombre_completo: u.nombre_completo, email: u.email, cargo: u.cargo, rol_nombre: roleName(c.db, u), regionales: u.regionales || [] }))
-}), { roles: ['ADMINISTRADOR'] });
+route('GET', '/api/usuarios', async () => {
+  const [L, us, ur] = await Promise.all([lookups(), D.fetchAll('usuarios', [['select', 'id,nombre_completo,email,cargo,rol_id,activo'], ['order', 'nombre_completo.asc']]), D.fetchAll('usuario_regional', [['select', 'usuario_id,regional_id']])]);
+  return { usuarios: us.map((u) => ({ id: u.id, nombre_completo: u.nombre_completo, email: u.email, cargo: u.cargo, activo: u.activo !== false, rol_nombre: canonRole((L.ROL.get(u.rol_id) || {}).nombre), regionales: ur.filter((x) => x.usuario_id === u.id).map((x) => x.regional_id) })) };
+}, { roles: ['ADMINISTRADOR'] });
 
 // ============================================================================
 // REPORTES (22 tipos, CSV)
 // ============================================================================
-const REPORTES = [
-  'inventario_general_nacional', 'inventario_por_regional', 'inventario_por_sede', 'inventario_por_responsable', 'activos_sin_codigo', 'activos_sin_serial',
-  'activos_sin_responsable', 'activos_sin_ubicacion', 'activos_incompletos', 'activos_nuevos', 'activos_no_encontrados', 'movimientos_de_activos',
-  'activos_de_excolaboradores', 'inventarios_conciliados', 'auditorias_por_regional', 'informes_de_calidad', 'hallazgos', 'acciones_correctivas',
-  'programaciones_de_inventario', 'cumplimiento_de_jornadas', 'historial_de_modificaciones', 'reporte_fotografico'
-];
-function reportData(c, n) {
-  const db = c.db;
+const REPORTES = ['inventario_general_nacional', 'inventario_por_regional', 'inventario_por_sede', 'inventario_por_responsable', 'activos_sin_codigo', 'activos_sin_serial', 'activos_sin_responsable', 'activos_sin_ubicacion', 'activos_incompletos', 'activos_nuevos', 'activos_no_encontrados', 'movimientos_de_activos', 'activos_de_excolaboradores', 'inventarios_conciliados', 'auditorias_por_regional', 'informes_de_calidad', 'hallazgos', 'acciones_correctivas', 'programaciones_de_inventario', 'cumplimiento_de_jornadas', 'historial_de_modificaciones', 'reporte_fotografico'];
+
+async function reportData(c, n) {
   const H = ['Código', 'Serial', 'Nombre', 'Categoría', 'Regional', 'Sede', 'Ubicación', 'Responsable', 'Estado físico', 'Estado operativo', 'Estado registro'];
   const row = (v) => [v.codigo_inventario || '', v.numero_serie || '', v.nombre, v.categoria_nombre || '', v.regional_nombre || '', v.sede_nombre || '', v.ubicacion_especifica, v.responsable_nombre || '', v.estado_fisico, v.estado_operativo, v.estado_registro];
-  const V = visibleActivos(c).map((a) => activoView(db, a));
-  const assets = (f, sort) => ({ h: H, r: V.filter(f || (() => true)).sort(sort || (() => 0)).map(row) });
+  const assets = async (f, sort) => {
+    const rows = await D.fetchAll('activos_maestros', [['select', ASSET_COLS], ...scopePair(c), ['order', 'id.asc']]);
+    const L = await lookups(), colabs = await colabsAll(), CM = new Map(colabs.map((k) => [k.id, k]));
+    const views = rows.map((a) => {
+      const res = CM.get(a.responsable_id), cat = L.C.get(a.categoria_id);
+      return { ...a, categoria_nombre: cat ? cat.nombre : '', regional_nombre: (L.R.get(a.regional_id) || {}).nombre || '', sede_nombre: (L.S.get(a.sede_id) || {}).nombre || '', responsable_nombre: res ? res.nombre_completo : '', responsable_estado: res ? res.estado_vinculacion : null, es_incompleto: incompleto(a) };
+    });
+    return { h: H, r: views.filter(f || (() => true)).sort(sort || (() => 0)).map(row) };
+  };
   const cmp = (k) => (a, b) => String(a[k] || '').localeCompare(String(b[k] || ''));
   switch (n) {
     case 1: return assets();
     case 2: return assets(null, cmp('regional_nombre'));
     case 3: return assets(null, cmp('sede_nombre'));
     case 4: return assets(null, cmp('responsable_nombre'));
-    case 5: return assets((v) => !v.codigo_inventario);
-    case 6: return assets((v) => !v.numero_serie);
+    case 5: return assets((v) => blank(v.codigo_inventario));
+    case 6: return assets((v) => blank(v.numero_serie));
     case 7: return assets((v) => !v.responsable_id);
-    case 8: return assets((v) => !v.sede_id || !v.ubicacion_especifica);
+    case 8: return assets((v) => !v.sede_id || blank(v.ubicacion_especifica));
     case 9: return assets((v) => v.es_incompleto);
-    case 10: return assets((v) => String(v.estado_registro).startsWith('NUEVO'));
-    case 11: return assets((v) => /NO ENCONTRADO/.test(v.estado_operativo + v.estado_registro));
-    case 13: return assets((v) => v.responsable_estado === 'RETIRADO');
-    case 14: return assets((v) => db.activos.find((a) => a.id === v.id).verificado_en);
-    case 12: return { h: ['Fecha', 'Activo', 'Código', 'Tipo', 'Motivo', 'Anterior', 'Nuevo', 'Usuario'], r: db.movimientos.filter((m) => inScope(c, actReg(db, m.activo_id))).map((m) => movView(db, m)).map((m) => [m.fecha, m.activo_nombre, m.codigo_inventario, m.tipo_movimiento, m.motivo, m.resp_ant_nombre || m.ubicacion_anterior || '', m.resp_nvo_nombre || m.ubicacion_nueva || '', m.usuario_nombre]) };
-    case 15: case 16: return { h: ['Código', 'Título', 'Regional', 'Sede', 'Fecha', 'Cumplimiento %', 'Hallazgos', 'Estado'], r: db.auditorias.filter((a) => inScope(c, a.regional_id)).map((a) => auditoriaView(db, a)).map((a) => [a.codigo, a.titulo, a.regional_nombre, a.sede_nombre || '', a.fecha_programada, a.porcentaje_cumplimiento, a.total_hallazgos, a.resultado_final || a.estado]) };
-    case 17: case 18: return { h: ['Código', 'Auditoría', 'Descripción', 'Activo', 'Regional', 'Criticidad', 'Compromiso', 'Estado', 'Acción realizada', 'Evidencia'], r: db.hallazgos.filter((h) => inScope(c, h.regional_id) && (n === 17 || h.accion_realizada)).map((h) => hallazgoView(db, h)).map((h) => [h.codigo, h.auditoria_codigo || 'Directo', h.descripcion, h.activo_nombre, h.regional_nombre, h.criticidad, h.fecha_compromiso, h.estado, h.accion_realizada, h.evidencia_correccion]) };
-    case 19: case 20: return { h: ['Jornada', 'Tipo', 'Regional', 'Inicio', 'Fin', 'Meta', 'Verificados', 'Avance %', 'Estado'], r: db.jornadas.filter((j) => inScope(c, j.regional_id)).map((j) => jornadaView(db, j)).map((j) => [j.titulo, j.tipo_actividad, j.regional_nombre, j.fecha_inicio, j.fecha_fin, j.meta_verificacion || j.total_activos_sede, j.activos_verificados, j.porcentaje_avance, j.estado]) };
-    case 21: return { h: ['Fecha', 'Activo', 'Campo', 'Anterior', 'Nuevo', 'Justificación'], r: db.novedades.filter((x) => inScope(c, x.regional_id != null ? x.regional_id : actReg(db, x.activo_id))).map((x) => { const a = findActivo(db, x.activo_id); return [x.fecha, a ? a.nombre : '', x.campo_modificado, x.valor_anterior, x.valor_nuevo, x.justificacion]; }) };
-    case 22: return { h: ['Activo', 'Código', 'Tipo de foto'], r: db.fotografias.filter((f) => inScope(c, actReg(db, f.activo_id))).map((f) => { const a = findActivo(db, f.activo_id); return [a ? a.nombre : '', a ? a.codigo_inventario || '' : '', f.tipo_foto]; }) };
+    case 10: return assets((v) => /^NUEVO/i.test(v.estado_registro || ''));
+    case 11: return assets((v) => /NO ENCONTRADO/i.test((v.estado_operativo || '') + ' ' + (v.estado_registro || '')));
+    case 13: return assets((v) => isRetirado({ estado_vinculacion: v.responsable_estado }));
+    case 14: {
+      const inv = new Set((await D.fetchAll('inventarios_fisicos', [['select', 'activo_id'], ['order', 'id.asc']])).map((x) => x.activo_id));
+      return assets((v) => inv.has(v.id));
+    }
+    case 12: {
+      const rows = await D.select('movimientos', [['select', '*'], ['order', 'fecha.desc'], ['limit', 1000]]);
+      const AM = await regionalOfActivos(rows.map((m) => m.activo_id));
+      const v = await movViews(rows.filter((m) => inScope(c, (AM.get(m.activo_id) || {}).regional_id)));
+      return { h: ['Fecha', 'Activo', 'Código', 'Tipo', 'Motivo', 'Anterior', 'Nuevo', 'Usuario'], r: v.map((m) => [m.fecha, m.activo_nombre, m.codigo_inventario, m.tipo_movimiento, m.motivo, m.resp_ant_nombre || m.ubicacion_anterior || '', m.resp_nvo_nombre || m.ubicacion_nueva || '', m.usuario_nombre]) };
+    }
+    case 15: case 16: {
+      const v = await auditoriaViews(await D.select('auditorias', [['select', '*'], ...scopePair(c), ['order', 'id.desc'], ['limit', 1000]]));
+      return { h: ['Código', 'Título', 'Regional', 'Sede', 'Fecha', 'Cumplimiento %', 'Hallazgos', 'Estado'], r: v.map((a) => [a.codigo, a.titulo, a.regional_nombre, a.sede_nombre || '', a.fecha_programada, a.porcentaje_cumplimiento, a.total_hallazgos, a.resultado_final || a.estado]) };
+    }
+    case 17: case 18: {
+      const v = await hallazgoViews(await D.select('hallazgos', [['select', '*'], ...scopePair(c), ...(n === 18 ? [['accion_correctiva', 'not.is.null']] : []), ['order', 'id.desc'], ['limit', 1000]]));
+      return { h: ['Código', 'Auditoría', 'Descripción', 'Activo', 'Regional', 'Criticidad', 'Compromiso', 'Estado', 'Acción realizada', 'Evidencia'], r: v.map((h) => [h.codigo, h.auditoria_codigo || 'Directo', h.descripcion, h.activo_nombre, h.regional_nombre, h.criticidad, h.fecha_compromiso, h.estado, h.accion_realizada, h.evidencia_correccion]) };
+    }
+    case 19: case 20: {
+      const v = await jornadaViews(await D.select('programaciones', [['select', '*'], ...scopePair(c), ['order', 'fecha_inicio.desc'], ['limit', 1000]]));
+      return { h: ['Jornada', 'Tipo', 'Regional', 'Inicio', 'Fin', 'Meta', 'Verificados', 'Avance %', 'Estado'], r: v.map((j) => [j.titulo, j.tipo_actividad, j.regional_nombre, j.fecha_inicio, j.fecha_fin, j.meta_verificacion || j.total_activos_sede, j.activos_verificados, j.porcentaje_avance, j.estado]) };
+    }
+    case 21: {
+      const rows = await D.select('novedades', [['select', '*'], ['order', 'fecha.desc'], ['limit', 1000]]);
+      const AM = await regionalOfActivos(rows.map((x) => x.activo_id));
+      return { h: ['Fecha', 'Activo', 'Campo', 'Anterior', 'Nuevo', 'Justificación'], r: rows.filter((x) => inScope(c, (AM.get(x.activo_id) || {}).regional_id)).map((x) => [co(x.fecha), (AM.get(x.activo_id) || {}).nombre || '', x.campo_modificado, x.valor_anterior, x.valor_nuevo, x.justificacion]) };
+    }
+    case 22: {
+      const rows = await D.select('fotografias_activos', [['select', 'id,activo_id,tipo_foto,descripcion'], ['order', 'id.desc'], ['limit', 1000]]);
+      const AM = await regionalOfActivos(rows.map((x) => x.activo_id));
+      return { h: ['Activo', 'Código', 'Tipo de foto', 'Descripción'], r: rows.filter((f) => inScope(c, (AM.get(f.activo_id) || {}).regional_id)).map((f) => [(AM.get(f.activo_id) || {}).nombre || '', (AM.get(f.activo_id) || {}).codigo_inventario || '', f.tipo_foto, f.descripcion || '']) };
+    }
     default: throw notFound('Reporte no existe');
   }
 }
-function csvReport(c, n) {
-  const d = reportData(c, n);
+async function csvReport(c, n) {
+  const d = await reportData(c, n);
   return { __raw: { type: 'text/csv; charset=utf-8', filename: `${REPORTES[n - 1]}_${todayCO()}.csv`, body: toCSV(d.h, d.r) } };
 }
 route('GET', '/api/reportes/:n', (c) => {
@@ -673,27 +931,31 @@ route('GET', '/api/reportes/:n', (c) => {
 // ============================================================================
 // LOGS DE ERRORES
 // ============================================================================
-route('POST', '/api/logs/client-error', (c) => {
+route('POST', '/api/logs/client-error', async (c) => {
   limit('clienterr:' + c.ip, 30, 60 * 1000);
   const b = c.body;
-  logError(c.db, 'ERROR', 'FRONTEND', b.mensaje || 'Error de cliente', `${b.stack || ''}\nURL: ${b.url || ''}`, c.user ? c.user.email : null);
+  await logError('ERROR', 'FRONTEND', b.mensaje || 'Error de cliente', `${b.stack || ''}\nURL: ${b.url || ''}`, c.user ? c.user.id : null, 'client', c.ip);
   return { ok: true };
 }, { public: true });
 
-route('GET', '/api/logs/errores', (c) => ({
-  errores: c.db.errores.slice().sort((a, b) => b.id - a.id).slice(0, Math.min(200, toInt(c.q.limit) || 30))
+async function logViews(rows) {
+  const us = await D.byIds('usuarios', rows.map((e) => e.resuelto_por), 'id,nombre_completo');
+  const UM = new Map(us.map((u) => [u.id, u]));
+  return rows.map((e) => ({ ...e, fecha: co(e.fecha), resuelto_por: e.resuelto_por ? (UM.get(e.resuelto_por) || {}).nombre_completo || 'Usuario' : null }));
+}
+route('GET', '/api/logs/errores', async (c) => ({
+  errores: await logViews(await D.select('logs_errores', { select: '*', order: 'fecha.desc', limit: Math.min(200, toInt(c.q.limit) || 30) }))
 }), { roles: ['ADMINISTRADOR'] });
 
-route('POST', '/api/logs/resolver/:id', (c) => {
-  const e = byId(c.db.errores, toInt(c.params.id));
-  if (!e) throw notFound('Error no encontrado');
+route('POST', '/api/logs/resolver/:id', async (c) => {
   if (!c.body.notas_solucion) throw bad('Indique las notas de la solución');
-  e.resuelto = true; e.notas_solucion = c.body.notas_solucion; e.resuelto_por = c.user.nombre_completo;
+  await D.update('logs_errores', { id: 'eq.' + toInt(c.params.id) }, { resuelto: true, notas_solucion: str(c.body.notas_solucion, 2000), resuelto_por: c.user.id, fecha_resolucion: nowISO() });
   return { ok: true };
 }, { roles: ['ADMINISTRADOR'] });
 
-route('GET', '/api/logs/download', (c) => {
-  const body = c.db.errores.map((e) => `[${e.fecha}] [${e.nivel}] [${e.modulo || 'N/A'}] #${e.id} ${unesc(e.mensaje)} | usuario=${e.usuario || '-'} | ${e.resuelto ? 'SOLUCIONADO: ' + unesc(e.notas_solucion) : 'PENDIENTE'}${e.detalle_tecnico ? '\n    ' + unesc(e.detalle_tecnico).replace(/\n/g, '\n    ') : ''}`).join('\n') || 'Sin errores registrados.';
+route('GET', '/api/logs/download', async () => {
+  const rows = await logViews(await D.select('logs_errores', { select: '*', order: 'fecha.desc', limit: 1000 }));
+  const body = rows.map((e) => `[${e.fecha}] [${e.nivel}] [${e.modulo || 'N/A'}] #${e.id} ${unesc(e.mensaje)} | ${e.resuelto ? 'SOLUCIONADO: ' + unesc(e.notas_solucion) : 'PENDIENTE'}${e.detalle_tecnico ? '\n    ' + unesc(e.detalle_tecnico).replace(/\n/g, '\n    ') : ''}`).join('\n') || 'Sin errores registrados.';
   return { __raw: { type: 'text/plain; charset=utf-8', filename: 'app_errors.log', body } };
 }, { roles: ['ADMINISTRADOR'] });
 
@@ -706,7 +968,7 @@ function send(res, status, body, headers = {}) {
   for (const k of Object.keys(headers)) res.setHeader(k, headers[k]);
   res.end(body);
 }
-const json = (res, status, obj) => send(res, status, JSON.stringify(obj), { 'Content-Type': 'application/json; charset=utf-8' });
+const json = (res, status, obj) => send(res, status, JSON.stringify(cleanOut(obj)), { 'Content-Type': 'application/json; charset=utf-8' });
 
 async function readBody(req) {
   if (req.body !== undefined && req.body !== null) {
@@ -720,7 +982,7 @@ async function readBody(req) {
 }
 
 module.exports = async function handler(req, res) {
-  let db = null, ctx = null;
+  let ctx = { path: '', ip: '' };
   try {
     const url = new URL(req.url, 'http://localhost');
     let path = url.pathname;
@@ -742,33 +1004,31 @@ module.exports = async function handler(req, res) {
     if (!matched) return json(res, pathMatched ? 405 : 404, { error: pathMatched ? 'Método no permitido' : `Ruta no encontrada: ${path}` });
 
     const mutating = method !== 'GET';
-    db = await getDb(mutating);
     const body = mutating ? sanitize(await readBody(req)) : {};
     const auth = String(req.headers.authorization || '');
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : q.token;
     const payload = verifyToken(token);
-    const user = payload ? db.usuarios.find((u) => u.id === payload.uid && u.activo) : null;
-    const role = user ? roleName(db, user) : null;
+    const user = payload && UUID.test(String(payload.uid)) ? await loadUser(payload.uid) : null;
     ctx = {
-      db, user, role, body, q, params: matched.params, req, scope: role === 'COORDINADOR' ? user.regionales || [] : null,
-      ip: String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim()
+      user, body, q, params: matched.params, req, path, scope: user && user.rol_nombre === 'COORDINADOR' ? user.regionales || [] : null,
+      ip: String(req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || '').split(',')[0].trim()
     };
 
     if (!matched.r.opts.public && !user) return json(res, 401, { error: 'Sesión expirada' });
-    if (matched.r.opts.roles && !matched.r.opts.roles.includes(role)) throw forbid('Su rol no tiene permiso para esta acción');
+    if (matched.r.opts.roles && !matched.r.opts.roles.includes(user && user.rol_nombre)) throw forbid('Su rol no tiene permiso para esta acción');
 
     const out = await matched.r.handler(ctx);
-    if (mutating) await saveDb();
     if (out && out.__raw) {
       return send(res, 200, out.__raw.body, { 'Content-Type': out.__raw.type, 'Content-Disposition': `attachment; filename="${out.__raw.filename}"` });
     }
     return json(res, 200, out);
   } catch (err) {
-    if (err instanceof HttpError) return json(res, err.status, { error: err.message });
+    if (err instanceof HttpError) {
+      if (err.status >= 500 && err.status !== 503) await logError('CRITICAL', 'BACKEND', err.message, err.stack, ctx.user && ctx.user.id, ctx.path, ctx.ip);
+      return json(res, err.status, { error: err.message });
+    }
     console.error(err);
-    try {
-      if (db) { logError(db, 'CRITICAL', 'BACKEND', err.message, err.stack, ctx && ctx.user ? ctx.user.email : null); await saveDb(); }
-    } catch (e) { /* ignorar */ }
+    await logError('CRITICAL', 'BACKEND', err.message, err.stack, ctx.user && ctx.user.id, ctx.path, ctx.ip);
     return json(res, 500, { error: 'Error interno del servidor. Quedó registrado en app_errors.log' });
   }
 };
