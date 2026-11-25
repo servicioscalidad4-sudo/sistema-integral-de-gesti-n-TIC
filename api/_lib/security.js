@@ -1,19 +1,27 @@
-// Contraseñas (scrypt) y tokens firmados (HMAC-SHA256). Sin dependencias externas.
+// Contraseñas (bcrypt, compatible con crypt() de Postgres) y tokens firmados (HMAC-SHA256).
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 const SECRET = process.env.JWT_SECRET || 'jr-secreto-de-desarrollo-CAMBIAR-en-Vercel';
 
-function hashPassword(pw) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  return `${salt}:${crypto.scryptSync(String(pw), salt, 32).toString('hex')}`;
-}
+const hashPassword = (pw) => bcrypt.hashSync(String(pw), 10);
 
 function verifyPassword(pw, stored) {
-  if (!stored || !stored.includes(':')) return false;
-  const [salt, h] = stored.split(':');
-  const calc = crypto.scryptSync(String(pw), salt, 32);
-  const hb = Buffer.from(h, 'hex');
-  return hb.length === calc.length && crypto.timingSafeEqual(hb, calc);
+  if (!stored) return false;
+  pw = String(pw);
+  try {
+    if (/^\$2[abxy]\$/.test(stored)) return bcrypt.compareSync(pw, stored);           // bcrypt
+    if (/^[a-f0-9]{64}$/i.test(stored)) {                                              // sha256 hex
+      const h = crypto.createHash('sha256').update(pw).digest('hex');
+      return crypto.timingSafeEqual(Buffer.from(h), Buffer.from(stored.toLowerCase()));
+    }
+    if (stored.includes(':')) {                                                        // scrypt salt:hash
+      const [salt, h] = stored.split(':');
+      const calc = crypto.scryptSync(pw, salt, 32), hb = Buffer.from(h, 'hex');
+      return hb.length === calc.length && crypto.timingSafeEqual(hb, calc);
+    }
+  } catch (e) { /* formato no reconocido */ }
+  return false;
 }
 
 function signToken(payload, ttlSeconds = 12 * 3600) {
@@ -32,9 +40,7 @@ function verifyToken(token) {
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
     const p = JSON.parse(Buffer.from(body, 'base64url').toString());
     return p.exp && p.exp > Date.now() / 1000 ? p : null;
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 module.exports = { hashPassword, verifyPassword, signToken, verifyToken };
